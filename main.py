@@ -4,12 +4,16 @@ Invoice/Quote PDF Extraction API
 FastAPI service that receives a PDF file, extracts text via pdfplumber,
 sends it to OpenAI with structured outputs, and returns a strictly
 formatted JSON ready for Bubble integration.
+
+V2 - Added:
+- Simplified LineItem (designation, quantity, unite, unit_price only)
+- No description extraction (to reduce AI load)
+- Product normalization for consistent naming across quotes
 """
 
 import os
 import io
 import logging
-from datetime import date
 from typing import Optional
 
 import pdfplumber
@@ -25,7 +29,7 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 # ─────────────────────────────────────────────
-# Pydantic schemas  (= contract with Bubble)
+# Pydantic schemas (= contract with Bubble)
 # ─────────────────────────────────────────────
 
 class Metadata(BaseModel):
@@ -36,11 +40,23 @@ class Metadata(BaseModel):
 
 
 class LineItem(BaseModel):
-    description: str = Field(..., description="Full product/service description (multi-line merged)")
+    designation: str = Field(
+        ...,
+        description=(
+            "Normalized product/service name. Use a clean, consistent short name "
+            "without descriptions. Example: 'Réparation joint épaufré' not "
+            "'Réparation joint épaufré : Sciage de part et d'autre...'"
+        ),
+    )
     quantity: float = Field(..., description="Quantity ordered")
-    unit_price: float = Field(..., description="Unit price excluding tax")
-    total_price: float = Field(..., description="Line total excluding tax")
-    sku_reference: Optional[str] = Field(None, description="SKU or product reference if present")
+    unite: str = Field(
+        ...,
+        description=(
+            "Unit of measurement as written on the document. "
+            "Common values: ML, M2, M3, FORF, U, KG, L, ENS, H, JR"
+        ),
+    )
+    unit_price: float = Field(..., description="Unit price excluding tax (PU HT)")
 
 
 class Totals(BaseModel):
@@ -68,7 +84,7 @@ class ExtractionResponse(BaseModel):
 def extract_text_from_pdf(pdf_bytes: bytes) -> str:
     """
     Extract text from every page of a PDF while preserving table
-    structure when possible.  Falls back to raw text if table
+    structure when possible. Falls back to raw text if table
     extraction yields nothing.
     """
     all_text_parts: list[str] = []
@@ -103,7 +119,9 @@ def extract_text_from_pdf(pdf_bytes: bytes) -> str:
 
     full_text = "\n\n".join(all_text_parts)
     if not full_text.strip():
-        raise ValueError("No text could be extracted from the PDF. It may be image-based (scanned).")
+        raise ValueError(
+            "No text could be extracted from the PDF. It may be image-based (scanned)."
+        )
     return full_text
 
 
@@ -112,25 +130,55 @@ def extract_text_from_pdf(pdf_bytes: bytes) -> str:
 # ─────────────────────────────────────────────
 
 SYSTEM_PROMPT = """\
-You are an expert document parser specialising in invoices and quotes.
+You are an expert document parser specialising in French invoices and quotes
+(devis, factures) for construction, building repair, and technical services.
 
 TASK:
 Given the raw text extracted from a PDF invoice or quote, return a single
 JSON object that matches the provided schema **exactly**.
 
-RULES:
-1. Identify fields semantically – never rely on position. Look for labels
-   like "Date", "Facture N°", "Total HT", "TVA", "TTC", "Montant", etc.
-2. If a product description spans multiple lines, merge them into one
-   coherent `description` string.
-3. Dates MUST be returned as YYYY-MM-DD. Convert from any format.
-4. Monetary values MUST be plain floats (no currency symbols, no spaces).
-5. If a field is truly absent from the document, use "" for strings and
-   0.0 for numbers. Never invent data.
-6. `currency` should be the ISO 4217 code (EUR, USD, GBP …). Infer from
-   symbols (€ → EUR, $ → USD) or context.
-7. `sku_reference` is optional – set to null if no SKU/reference exists.
-8. Prefer values explicitly written in the document over computed ones.
+RULES FOR LINE ITEMS:
+1. Extract ONLY lines from the pricing table that have a quantity AND a unit price.
+2. For `designation`: use ONLY the short product/service name (the bold or first line).
+   Do NOT include descriptions, technical details, or sub-text.
+   Examples:
+   - GOOD: "Réparation joint épaufré"
+   - BAD:  "Réparation joint épaufré : Sciage de part et d'autre sur largeur..."
+   - GOOD: "Pianotage"
+   - BAD:  "Pianotage : Traitement du pianotage par injection de résine..."
+   - GOOD: "AMENÉ ET REPLI DU MATÉRIEL - Zone 1"
+3. NORMALIZE designations for consistency:
+   - Capitalize first letter of each significant word
+   - Fix obvious typos (e.g., "épaufré" → "Épaufré")
+   - Use consistent naming (always "Réparation Joint Épaufré", never
+     "Rep. joint epaufré" or "REPARATION JOINT EPAUFRE")
+   - Keep zone/area identifiers (e.g., "- Zone 1", "- Cellule A1")
+4. For `unite`: use the unit code as written (ML, M2, FORF, U, KG, etc.)
+5. For `unit_price`: the price per unit excluding tax (PU HT)
+6. For `quantity`: the quantity (Qté)
+7. Do NOT extract:
+   - Section headers (e.g., "Cellule A1") that have no price
+   - Sub-total lines or summary lines
+   - Description paragraphs below product names
+   - Lines with only text and no numeric values
+
+RULES FOR METADATA:
+1. `vendor_name`: the company issuing the invoice/quote
+2. `invoice_number`: the document reference (Devis N°, Facture N°, Ref, etc.)
+3. `date`: document date in YYYY-MM-DD format. Convert from any format.
+4. `currency`: ISO 4217 code. Infer from symbols (€ → EUR)
+
+RULES FOR TOTALS:
+1. Use values explicitly written in the document
+2. `subtotal_ht`: Total before tax
+3. `total_tax`: Total TVA amount
+4. `total_ttc`: Grand total including tax
+
+GENERAL RULES:
+- Monetary values MUST be plain floats (no currency symbols, no spaces)
+- If a field is truly absent, use "" for strings, 0.0 for numbers
+- Never invent data
+- Prefer values explicitly written in the document over computed ones
 """
 
 
@@ -149,7 +197,9 @@ class InvoiceExtractor:
         Send extracted PDF text to OpenAI and get back a validated
         InvoiceData object using Structured Outputs (response_format).
         """
-        logger.info("Calling OpenAI (%s) with %d chars of text", self.model, len(pdf_text))
+        logger.info(
+            "Calling OpenAI (%s) with %d chars of text", self.model, len(pdf_text)
+        )
 
         # Truncate very long documents to stay within context limits
         max_chars = 60_000
@@ -161,17 +211,21 @@ class InvoiceExtractor:
             temperature=0,  # deterministic
             messages=[
                 {"role": "system", "content": SYSTEM_PROMPT},
-                {"role": "user", "content": f"Extract data from this document:\n\n{pdf_text}"},
+                {
+                    "role": "user",
+                    "content": f"Extract data from this document:\n\n{pdf_text}",
+                },
             ],
             response_format=InvoiceData,
         )
 
         parsed = response.choices[0].message.parsed
         if parsed is None:
-            # Should not happen with structured outputs, but guard anyway
             raise ValueError("OpenAI returned an unparseable response")
 
-        logger.info("Extraction successful: %s items found", len(parsed.line_items))
+        logger.info(
+            "Extraction successful: %d line items found", len(parsed.line_items)
+        )
         return parsed
 
 
@@ -181,8 +235,12 @@ class InvoiceExtractor:
 
 app = FastAPI(
     title="Invoice Extraction API",
-    version="1.0.0",
-    description="Upload a PDF invoice/quote → get structured JSON back.",
+    version="2.0.0",
+    description=(
+        "Upload a PDF invoice/quote → get structured JSON back. "
+        "V2: simplified line items (designation, quantity, unite, unit_price), "
+        "normalized product names for consistent matching."
+    ),
 )
 
 app.add_middleware(
@@ -205,7 +263,7 @@ def get_extractor() -> InvoiceExtractor:
 
 @app.get("/health")
 async def health():
-    return {"status": "ok"}
+    return {"status": "ok", "version": "2.0.0"}
 
 
 @app.post("/extract", response_model=ExtractionResponse)
@@ -227,7 +285,9 @@ async def extract_invoice(file: UploadFile = File(...)):
             raise HTTPException(status_code=400, detail="Uploaded file is empty")
 
         # ── Step 1: Extract text ──
-        logger.info("Extracting text from %s (%d bytes)", file.filename, len(pdf_bytes))
+        logger.info(
+            "Extracting text from %s (%d bytes)", file.filename, len(pdf_bytes)
+        )
         pdf_text = extract_text_from_pdf(pdf_bytes)
         logger.info("Extracted %d characters of text", len(pdf_text))
 
@@ -242,4 +302,6 @@ async def extract_invoice(file: UploadFile = File(...)):
         return ExtractionResponse(success=False, error=str(e))
     except Exception as e:
         logger.exception("Unexpected error during extraction")
-        return ExtractionResponse(success=False, error=f"Internal error: {type(e).__name__}: {e}")
+        return ExtractionResponse(
+            success=False, error=f"Internal error: {type(e).__name__}: {e}"
+        )

@@ -1,8 +1,9 @@
 """
-Invoice/Quote PDF Extraction API - V10.2 (Low Memory Edition)
-=============================================================
-- Optimisation RAM : Utilisation de pypdf pour le scanning (léger) au lieu de pdfplumber (lourd).
-- Garbage Collection forcé.
+Invoice/Quote PDF Extraction API - V10.3 (Ultra-Light Crop)
+===========================================================
+- Optimisation RAM SUPRÊME :
+  1. On ne lit que les 50% du haut de la première page pour les métadonnées.
+  2. On ignore les tableaux et le bas de page lors du tri.
 """
 
 import os
@@ -11,7 +12,7 @@ import logging
 import base64
 import re
 import asyncio
-import gc  # Import important pour la gestion mémoire
+import gc
 from typing import Optional
 
 import pdfplumber
@@ -109,23 +110,22 @@ class SplitExtractResponse(BaseModel):
 
 
 # ─────────────────────────────────────────────
-# Extraction texte PDF (Extraction fine)
+# Extraction texte PDF (Extraction fine IA)
 # ─────────────────────────────────────────────
 
 def extract_text_from_pdf(pdf_bytes: bytes) -> str:
     """
-    Utilise pdfplumber pour extraire le texte avec précision (tables).
-    Gourmand en RAM, à utiliser uniquement sur des fichiers découpés.
+    Pour l'IA (/extract), on a besoin de TOUT le texte (lignes, prix).
+    On garde donc pdfplumber ici, mais on fait attention au nettoyage.
     """
     all_text_parts: list[str] = []
     
-    # Context manager pour s'assurer que pdfplumber libère la mémoire
     with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf:
         for page_num, page in enumerate(pdf.pages, start=1):
             page_text_parts: list[str] = [f"--- Page {page_num} ---"]
             
-            # Extraction tables (lourd)
             try:
+                # Extraction "lourde" des tables pour l'IA
                 tables = page.extract_tables(
                     table_settings={
                         "vertical_strategy": "lines_strict",
@@ -138,7 +138,7 @@ def extract_text_from_pdf(pdf_bytes: bytes) -> str:
                             cleaned = [cell.strip() if cell else "" for cell in row]
                             page_text_parts.append(" | ".join(cleaned))
             except Exception:
-                pass # Si table échoue, on continue
+                pass
                 
             non_table_text = page.extract_text()
             if non_table_text:
@@ -146,11 +146,11 @@ def extract_text_from_pdf(pdf_bytes: bytes) -> str:
             
             all_text_parts.append("\n".join(page_text_parts))
             
-            # Nettoyage explicite par page si nécessaire
-            del page 
+            # Flush mémoire page par page
+            page.flush_cache()
 
     full_text = "\n\n".join(all_text_parts)
-    gc.collect() # Forcer le nettoyage RAM
+    gc.collect()
     
     if not full_text.strip():
         raise ValueError("Aucun texte n'a pu être extrait du PDF.")
@@ -163,18 +163,18 @@ def extract_text_from_pdf(pdf_bytes: bytes) -> str:
 
 def split_pdf_into_parts(pdf_bytes: bytes) -> list[dict]:
     """
-    Découpe le PDF.
-    OPTIMISATION : Utilise pypdf pour scanner le texte (beaucoup plus léger que pdfplumber).
+    Découpe le PDF en utilisant pypdf (léger).
     """
     split_points = []
     devis_names = []
     
-    # 1. SCAN LÉGER avec PyPDF (évite de charger le layout graphique en RAM)
+    # SCAN LÉGER avec PyPDF
     reader_scan = PdfReader(io.BytesIO(pdf_bytes))
     total_pages = len(reader_scan.pages)
     
     for i in range(total_pages):
         try:
+            # Extraction basique, rapide et peu gourmande
             page_text = reader_scan.pages[i].extract_text() or ""
             match = re.search(r"DE\d{4,10}", page_text, re.IGNORECASE)
             if match:
@@ -191,11 +191,10 @@ def split_pdf_into_parts(pdf_bytes: bytes) -> list[dict]:
 
     logger.info(f"Découpage : {len(split_points) - 1} devis sur {total_pages} pages.")
     
-    # Libérer le reader de scan
     del reader_scan
     gc.collect()
 
-    # 2. DÉCOUPAGE
+    # DÉCOUPAGE PHYSIQUE
     reader_write = PdfReader(io.BytesIO(pdf_bytes))
     parts = []
 
@@ -211,8 +210,6 @@ def split_pdf_into_parts(pdf_bytes: bytes) -> list[dict]:
 
         sub_pdf_io = io.BytesIO()
         writer.write(sub_pdf_io)
-        
-        # On récupère les bytes tout de suite et on ferme le buffer
         result_bytes = sub_pdf_io.getvalue()
         sub_pdf_io.close()
 
@@ -223,25 +220,39 @@ def split_pdf_into_parts(pdf_bytes: bytes) -> list[dict]:
             "page_end": end_page,
         })
         
-        # Nettoyage intermédiaire pour les gros fichiers
         del writer
         
     del reader_write
-    gc.collect() # Gros nettoyage avant de renvoyer
+    gc.collect()
     return parts
 
 
 # ─────────────────────────────────────────────
-# Extraction Metadata par REGEX (Corrigée & Optimisée)
+# Extraction Metadata par REGEX (CROP OPTIMISÉ)
 # ─────────────────────────────────────────────
 
 def extract_metadata_regex(pdf_bytes: bytes, file_name: str) -> dict:
+    """
+    Extrait les metadata en ne lisant QUE le haut de la première page.
+    Économise énormément de RAM en ignorant les tableaux de prix.
+    """
     text = ""
-    # On utilise pdfplumber ici car on a besoin de la précision spatiale pour les tableaux
     try:
         with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf:
             if pdf.pages:
-                text = pdf.pages[0].extract_text() or ""
+                page = pdf.pages[0]
+                
+                # === OPTIMISATION MAJEURE ===
+                # On ne prend que les 60% du haut de la page.
+                # Cela couvre : Logo, En-tête, Destinataire, Chantier.
+                # Cela EXCLUT : La majorité des lignes de produits (lourdes).
+                width = page.width
+                height = page.height
+                crop_box = (0, 0, width, height * 0.60) # (x0, top, x1, bottom)
+                
+                cropped_page = page.within_bbox(crop_box)
+                text = cropped_page.extract_text() or ""
+                
     except Exception as e:
         logger.warning(f"Erreur lecture PDF {file_name}: {e}")
         return {
@@ -417,8 +428,8 @@ class InvoiceExtractor:
 
 app = FastAPI(
     title="Invoice Extraction & Split API",
-    version="10.2.0",
-    description="V10.2: Low Memory Optimization (PyPDF for detection + GC).",
+    version="10.3.0",
+    description="V10.3: Ultra-Light RAM Mode (Cropped Metadata Extraction).",
 )
 
 app.add_middleware(
@@ -435,11 +446,11 @@ def get_extractor() -> InvoiceExtractor:
 
 @app.get("/")
 async def root():
-    return {"message": "API Active. Low RAM mode."}
+    return {"message": "API Active. Ultra-Low RAM mode."}
 
 @app.get("/health")
 async def health():
-    return {"status": "ok", "version": "10.2.0"}
+    return {"status": "ok", "version": "10.3.0"}
 
 
 # ─────────────────────────────────────────────
@@ -452,8 +463,6 @@ async def split_pdf(file: UploadFile = File(...)):
     try:
         content = await file.read()
         parts = split_pdf_into_parts(content)
-        
-        # Libérer la mémoire du fichier source immédiatement
         del content
         gc.collect()
 
@@ -465,7 +474,6 @@ async def split_pdf(file: UploadFile = File(...)):
             for p in parts
         ]
         
-        # Nettoyage
         del parts
         gc.collect()
         
@@ -484,11 +492,7 @@ async def extract_invoice(file: UploadFile = File(...)):
         raise HTTPException(status_code=400, detail="Expected a PDF file")
     try:
         pdf_bytes = await file.read()
-        
-        # Extraction texte
         pdf_text = extract_text_from_pdf(pdf_bytes)
-        
-        # Libération immédiate des bytes
         del pdf_bytes
         gc.collect()
 
@@ -513,8 +517,6 @@ async def split_light(file: UploadFile = File(...)):
         logger.info("=== SPLIT-LIGHT : Début ===")
         
         parts = split_pdf_into_parts(pdf_bytes)
-        
-        # On peut supprimer les bytes originaux maintenant pour faire de la place
         del pdf_bytes
         gc.collect()
         
@@ -525,6 +527,7 @@ async def split_light(file: UploadFile = File(...)):
 
         for part in parts:
             try:
+                # C'est ici que l'optimisation joue : on ne lit que le haut de page
                 meta = extract_metadata_regex(part["pdf_bytes"], part["file_name"])
 
                 vendor_name = meta["vendor_name"]
@@ -552,7 +555,6 @@ async def split_light(file: UploadFile = File(...)):
                     "error": str(e),
                 })
         
-        # Gros nettoyage final
         del parts
         gc.collect()
 
@@ -575,7 +577,6 @@ async def split_light(file: UploadFile = File(...)):
 # ─────────────────────────────────────────────
 @app.post("/split-and-extract", response_model=SplitExtractResponse)
 async def split_and_extract(file: UploadFile = File(...)):
-    # ATTENTION : Cette route est la plus dangereuse pour la RAM
     if file.content_type not in ("application/pdf", "application/octet-stream"):
         raise HTTPException(status_code=400, detail="Expected a PDF file")
 
@@ -593,7 +594,6 @@ async def split_and_extract(file: UploadFile = File(...)):
         results: list[SplitExtractItem] = []
         errors: list[SplitExtractError] = []
 
-        # Batch size 1 pour éviter de faire exploser la RAM lors des appels OpenAI
         for part in parts:
             try:
                 pdf_text = extract_text_from_pdf(part["pdf_bytes"])
@@ -606,7 +606,6 @@ async def split_and_extract(file: UploadFile = File(...)):
                     pdf_base64=pdf_base64,
                     extraction=invoice_data,
                 ))
-                # On nettoie le texte extrait
                 del pdf_text
                 gc.collect()
                 

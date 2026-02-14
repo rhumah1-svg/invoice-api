@@ -269,24 +269,33 @@ def extract_metadata_regex(pdf_bytes: bytes, file_name: str) -> dict:
                     break
 
     # ── Project Name (chantier) ──
-    # Le chantier est dans le tableau juste après l'en-tête "Chantier"
+    # Le chantier est dans le tableau. pdfplumber peut mélanger les colonnes :
+    #   "Chantier Date Date de validité de l'offre Condition..."
+    #   "AREFIM - REIMS (51) 09/02/2021 11/03/2021 VIREMENT..."
     project_name = "INCONNU"
     
     for i, line in enumerate(lines):
         line_stripped = line.strip()
         # Chercher la ligne d'en-tête du tableau contenant "Chantier"
-        if "Chantier" in line_stripped and "Date" in line_stripped:
+        if "Chantier" in line_stripped:
             # La ligne suivante contient les valeurs du tableau
             if i + 1 < len(lines):
                 next_line = lines[i + 1].strip()
-                # Le chantier est au début de la ligne, avant la date
-                # Format : "AREFIM - REIMS (51) 09/02/2021 ..."
+                # Le chantier est au début, avant la première date JJ/MM/AAAA
                 date_match = re.search(r"\d{2}/\d{2}/\d{4}", next_line)
                 if date_match:
                     project_name = next_line[:date_match.start()].strip()
                 else:
-                    # Prendre le premier segment significatif
-                    project_name = next_line.split("  ")[0].strip()
+                    # Pas de date trouvée : couper avant les mots parasites
+                    # qui viennent des en-têtes de colonnes mélangés
+                    clean = re.split(
+                        r"\s+(?:de l'offre|Date|Condition|VIREMENT|N°|Tva)",
+                        next_line, flags=re.IGNORECASE
+                    )[0].strip()
+                    if clean:
+                        project_name = clean
+                    else:
+                        project_name = next_line.split("  ")[0].strip()
             break
     
     # Fallback : chercher après "Chantier :" ou "Chantier:"
@@ -296,7 +305,14 @@ def extract_metadata_regex(pdf_bytes: bytes, file_name: str) -> dict:
             text, re.IGNORECASE
         )
         if chantier_match:
-            project_name = chantier_match.group(1).strip()
+            candidate = chantier_match.group(1).strip()
+            # Nettoyer les mots parasites des en-têtes
+            candidate = re.split(
+                r"\s+(?:Date|de l'offre|Condition|VIREMENT|N°|Tva)",
+                candidate, flags=re.IGNORECASE
+            )[0].strip()
+            if candidate:
+                project_name = candidate
 
     # ── Nettoyage final ──
     vendor_name = re.sub(r"[,;.\s]+$", "", vendor_name)[:100]

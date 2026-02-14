@@ -1,6 +1,6 @@
 """
-Invoice/Quote PDF Extraction API - V10.0
-=========================================
+Invoice/Quote PDF Extraction API - V10.1 (Fix Regex Chantier)
+=============================================================
 - /split            → Découpage seul (retourne base64)
 - /extract          → Extraction IA seule (1 PDF)
 - /split-and-extract → Split + Extract IA en masse
@@ -196,18 +196,14 @@ def split_pdf_into_parts(pdf_bytes: bytes) -> list[dict]:
 
 
 # ─────────────────────────────────────────────
-# Extraction Metadata par REGEX (sans IA)
+# Extraction Metadata par REGEX (CORRIGÉE)
 # ─────────────────────────────────────────────
 
 def extract_metadata_regex(pdf_bytes: bytes, file_name: str) -> dict:
     """
     Extrait vendor_name, project_name et invoice_number depuis le texte
-    du PDF en utilisant uniquement des regex. Ultra rapide, pas d'IA.
-    
-    Structure devis Qualidal :
-    - En-tête droite : "Monsieur Jean-Eudes GOHARD" puis "IDEC" (entreprise)
-    - Tableau : Chantier | Date | ... avec "AREFIM - REIMS (51)" sous Chantier
-    - Numéro : DE00001898 en haut à droite
+    du PDF en utilisant uniquement des regex. 
+    CORRECTION: Gestion des en-têtes sur plusieurs lignes (ex: "de l'offre").
     """
     text = ""
     try:
@@ -232,93 +228,96 @@ def extract_metadata_regex(pdf_bytes: bytes, file_name: str) -> dict:
         invoice_number = file_name.replace(".pdf", "")
 
     # ── Vendor Name (entreprise cliente) ──
-    # Structure Qualidal : "Monsieur/Madame Prénom NOM" puis ligne suivante = entreprise
     vendor_name = "INCONNU"
     
     for i, line in enumerate(lines):
         line_stripped = line.strip()
-        # Chercher "Monsieur" ou "Madame" suivi d'un nom
         if re.match(r"^(Monsieur|Madame|M\.|Mme)\s+", line_stripped, re.IGNORECASE):
-            # La ligne suivante est souvent le nom de l'entreprise
             if i + 1 < len(lines):
                 next_line = lines[i + 1].strip()
-                # Vérifier que c'est pas une adresse (pas de chiffre au début)
                 if next_line and not re.match(r"^\d", next_line):
                     vendor_name = next_line
                     break
     
-    # Fallback : chercher une ligne courte en majuscules après le bloc Qualidal
     if vendor_name == "INCONNU":
         found_qualidal_block = False
         for line in lines:
             line_stripped = line.strip()
-            # Détecter qu'on est après le bloc Qualidal (après "Email" ou "Fax")
             if "email" in line_stripped.lower() or "fax" in line_stripped.lower():
                 found_qualidal_block = True
                 continue
             if found_qualidal_block and line_stripped:
-                # Ligne courte en majuscules = probablement l'entreprise
-                if (len(line_stripped) > 2 and len(line_stripped) < 50 and
-                    line_stripped == line_stripped.upper() and
-                    not any(kw in line_stripped for kw in [
-                        "DEVIS", "FACTURE", "TVA", "HT", "TTC", "PAGE", 
-                        "DATE", "TOTAL", "QUALIDAL", "CREIL", "CS ", 
-                        "CEDEX", "RUE", "AVENUE", "BOULEVARD"
-                    ])):
+                # Vérifie que ce n'est pas un mot clé technique
+                is_uppercase = (line_stripped == line_stripped.upper())
+                is_clean = not any(kw in line_stripped for kw in [
+                    "DEVIS", "FACTURE", "TVA", "HT", "TTC", "PAGE", 
+                    "DATE", "TOTAL", "QUALIDAL", "CREIL", "CEDEX"
+                ])
+                if len(line_stripped) > 2 and len(line_stripped) < 50 and is_uppercase and is_clean:
                     vendor_name = line_stripped
                     break
 
-    # ── Project Name (chantier) ──
-    # Le chantier est dans le tableau. pdfplumber peut mélanger les colonnes :
-    #   "Chantier Date Date de validité de l'offre Condition..."
-    #   "AREFIM - REIMS (51) 09/02/2021 11/03/2021 VIREMENT..."
+    # ── Project Name (chantier) - CORRECTION ICI ──
     project_name = "INCONNU"
     
     for i, line in enumerate(lines):
         line_stripped = line.strip()
+        
         # Chercher la ligne d'en-tête du tableau contenant "Chantier"
         if "Chantier" in line_stripped:
-            # La ligne suivante contient les valeurs du tableau
-            if i + 1 < len(lines):
-                next_line = lines[i + 1].strip()
-                # Le chantier est au début, avant la première date JJ/MM/AAAA
-                date_match = re.search(r"\d{2}/\d{2}/\d{4}", next_line)
-                if date_match:
-                    project_name = next_line[:date_match.start()].strip()
-                else:
-                    # Pas de date trouvée : couper avant les mots parasites
-                    # qui viennent des en-têtes de colonnes mélangés
+            
+            # On regarde les lignes suivantes (jusqu'à 4 lignes en dessous)
+            # pour trouver la vraie ligne de données et sauter "de l'offre"
+            for offset in range(1, 5):
+                if i + offset >= len(lines):
+                    break
+                
+                next_line = lines[i + offset].strip()
+                if not next_line:
+                    continue
+
+                # 1. Si la ligne contient "de l'offre", "validité" SANS date chiffrée
+                # C'est un reste d'en-tête (parasite) => ON LE SAUTE
+                is_parasite = ("de l'offre" in next_line.lower() or 
+                               "validité" in next_line.lower() or
+                               "condition" in next_line.lower())
+                has_date = re.search(r"\d{2}/\d{2}/\d{4}", next_line)
+                
+                if is_parasite and not has_date:
+                    continue # On passe à la ligne suivante
+
+                # 2. Si on trouve une date (ex: 30/01/2026), le chantier est juste avant
+                if has_date:
+                    # On coupe tout ce qui est après le début de la date
+                    candidate = next_line[:has_date.start()].strip()
+                    # On nettoie les séparateurs de colonnes
+                    project_name = candidate.strip(" |")
+                    break 
+                
+                # 3. Fallback : Si ligne consistante sans date et pas parasite
+                elif len(next_line) > 3 and not is_parasite:
+                     # Nettoyage barbare des mots parasites
                     clean = re.split(
-                        r"\s+(?:de l'offre|Date|Condition|VIREMENT|N°|Tva)",
+                        r"\s+(?:de l'offre|Date|Condition|VIREMENT|N°|Tva|€)", 
                         next_line, flags=re.IGNORECASE
                     )[0].strip()
                     if clean:
                         project_name = clean
-                    else:
-                        project_name = next_line.split("  ")[0].strip()
-            break
-    
-    # Fallback : chercher après "Chantier :" ou "Chantier:"
+                        break
+            
+            if project_name != "INCONNU":
+                break # On sort de la boucle principale
+
+    # Fallback ultime
     if project_name == "INCONNU":
-        chantier_match = re.search(
-            r"Chantier\s*[:\-]?\s*(.+?)(?:\d{2}/\d{2}/\d{4}|$)", 
-            text, re.IGNORECASE
-        )
+        chantier_match = re.search(r"Chantier\s*[:\-]?\s*(.+?)(?:\d{2}/\d{2}/\d{4}|$)", text, re.IGNORECASE)
         if chantier_match:
-            candidate = chantier_match.group(1).strip()
-            # Nettoyer les mots parasites des en-têtes
-            candidate = re.split(
-                r"\s+(?:Date|de l'offre|Condition|VIREMENT|N°|Tva)",
-                candidate, flags=re.IGNORECASE
-            )[0].strip()
-            if candidate:
-                project_name = candidate
+            project_name = chantier_match.group(1).strip()
 
     # ── Nettoyage final ──
     vendor_name = re.sub(r"[,;.\s]+$", "", vendor_name)[:100]
     project_name = re.sub(r"[,;.\s]+$", "", project_name)[:100]
     
-    # Remplacer les caractères interdits dans les noms de dossiers OneDrive
     for char in ['/', '\\', ':', '*', '?', '"', '<', '>', '|']:
         vendor_name = vendor_name.replace(char, '-')
         project_name = project_name.replace(char, '-')
@@ -415,8 +414,8 @@ class InvoiceExtractor:
 
 app = FastAPI(
     title="Invoice Extraction & Split API",
-    version="10.0.0",
-    description="V10: Added /split-light for fast regex-based splitting with OneDrive path generation.",
+    version="10.1.0",
+    description="V10.1: Fix extraction Chantier (skip 'de l'offre').",
 )
 
 app.add_middleware(
@@ -437,7 +436,7 @@ async def root():
 
 @app.get("/health")
 async def health():
-    return {"status": "ok", "version": "10.0.0"}
+    return {"status": "ok", "version": "10.1.0"}
 
 
 # ─────────────────────────────────────────────
@@ -489,7 +488,6 @@ async def extract_invoice(file: UploadFile = File(...)):
 
 # ─────────────────────────────────────────────
 # ROUTE 3: /split-light (Split + Regex, SANS IA)
-# Pour le WF1 masse : classe les PDFs dans OneDrive
 # ─────────────────────────────────────────────
 @app.post("/split-light", response_model=SplitLightResponse)
 async def split_light(file: UploadFile = File(...)):

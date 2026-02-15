@@ -405,7 +405,7 @@ async def split_light(file: UploadFile = File(...)):
                 letter = vendor[0].upper() if vendor and vendor[0].isalpha() else "#"
                 
                 # DOSSIER DE BASE
-                base_folder = "/split dossier"
+                base_folder = "/PROD"
                 path = f"{base_folder}/{letter}/{vendor}/{project}/Devis et commande/{inv_num}.pdf"
                 
                 b64 = base64.b64encode(part["pdf_bytes"]).decode("utf-8")

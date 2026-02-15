@@ -1,9 +1,9 @@
 """
-Invoice/Quote PDF Extraction API - V10.3 (Ultra-Light Crop)
+Invoice/Quote PDF Extraction API - V10.4 (Stable & Low RAM)
 ===========================================================
-- Optimisation RAM SUPRÊME :
-  1. On ne lit que les 50% du haut de la première page pour les métadonnées.
-  2. On ignore les tableaux et le bas de page lors du tri.
+- Découpage : Via PyPDF (Rapide & Léger)
+- Metadata : Lecture de la PAGE 1 UNIQUEMENT (Pas de crop physique risqué)
+- Logique : Algorithme de détection "Chantier" avec saut de lignes parasites
 """
 
 import os
@@ -110,99 +110,72 @@ class SplitExtractResponse(BaseModel):
 
 
 # ─────────────────────────────────────────────
-# Extraction texte PDF (Extraction fine IA)
+# 1. Extraction texte PDF (Pour IA - Complet)
 # ─────────────────────────────────────────────
-
 def extract_text_from_pdf(pdf_bytes: bytes) -> str:
-    """
-    Pour l'IA (/extract), on a besoin de TOUT le texte (lignes, prix).
-    On garde donc pdfplumber ici, mais on fait attention au nettoyage.
-    """
+    """Extraction complète pour l'analyse IA (/extract)"""
     all_text_parts: list[str] = []
-    
     with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf:
         for page_num, page in enumerate(pdf.pages, start=1):
             page_text_parts: list[str] = [f"--- Page {page_num} ---"]
-            
             try:
-                # Extraction "lourde" des tables pour l'IA
-                tables = page.extract_tables(
-                    table_settings={
-                        "vertical_strategy": "lines_strict",
-                        "horizontal_strategy": "lines_strict",
-                    }
-                )
+                tables = page.extract_tables(table_settings={"vertical_strategy": "lines_strict", "horizontal_strategy": "lines_strict"})
                 if tables:
                     for table in tables:
                         for row in table:
                             cleaned = [cell.strip() if cell else "" for cell in row]
                             page_text_parts.append(" | ".join(cleaned))
-            except Exception:
-                pass
-                
+            except Exception: pass
+            
             non_table_text = page.extract_text()
-            if non_table_text:
-                page_text_parts.append(non_table_text)
-            
+            if non_table_text: page_text_parts.append(non_table_text)
             all_text_parts.append("\n".join(page_text_parts))
-            
-            # Flush mémoire page par page
             page.flush_cache()
 
-    full_text = "\n\n".join(all_text_parts)
     gc.collect()
-    
-    if not full_text.strip():
-        raise ValueError("Aucun texte n'a pu être extrait du PDF.")
+    full_text = "\n\n".join(all_text_parts)
+    if not full_text.strip(): raise ValueError("PDF vide ou illisible")
     return full_text
 
 
 # ─────────────────────────────────────────────
-# Découpage PDF (OPTIMISÉ RAM)
+# 2. Découpage PDF (Optimisé PyPDF)
 # ─────────────────────────────────────────────
-
 def split_pdf_into_parts(pdf_bytes: bytes) -> list[dict]:
-    """
-    Découpe le PDF en utilisant pypdf (léger).
-    """
+    """Découpe le fichier en utilisant pypdf (léger en RAM)"""
     split_points = []
     devis_names = []
     
-    # SCAN LÉGER avec PyPDF
+    # Scan rapide
     reader_scan = PdfReader(io.BytesIO(pdf_bytes))
     total_pages = len(reader_scan.pages)
     
     for i in range(total_pages):
         try:
-            # Extraction basique, rapide et peu gourmande
             page_text = reader_scan.pages[i].extract_text() or ""
             match = re.search(r"DE\d{4,10}", page_text, re.IGNORECASE)
             if match:
                 split_points.append(i)
                 clean_name = f"devis_{match.group(0).lower()}"
                 devis_names.append(clean_name)
-        except Exception:
-            continue
+        except Exception: continue
 
     if not split_points or split_points[0] != 0:
         split_points.insert(0, 0)
         devis_names.insert(0, "devis_inconnu")
     split_points.append(total_pages)
 
-    logger.info(f"Découpage : {len(split_points) - 1} devis sur {total_pages} pages.")
-    
     del reader_scan
     gc.collect()
 
-    # DÉCOUPAGE PHYSIQUE
+    # Écriture des parties
     reader_write = PdfReader(io.BytesIO(pdf_bytes))
     parts = []
 
     for i in range(len(split_points) - 1):
         start_page = split_points[i]
         end_page = split_points[i + 1]
-        if start_page >= end_page:
-            continue
+        if start_page >= end_page: continue
 
         writer = PdfWriter()
         for j in range(start_page, end_page):
@@ -210,56 +183,38 @@ def split_pdf_into_parts(pdf_bytes: bytes) -> list[dict]:
 
         sub_pdf_io = io.BytesIO()
         writer.write(sub_pdf_io)
-        result_bytes = sub_pdf_io.getvalue()
-        sub_pdf_io.close()
-
         parts.append({
             "file_name": f"{devis_names[i]}.pdf",
-            "pdf_bytes": result_bytes,
+            "pdf_bytes": sub_pdf_io.getvalue(),
             "page_start": start_page + 1,
             "page_end": end_page,
         })
-        
+        sub_pdf_io.close()
         del writer
-        
+
     del reader_write
     gc.collect()
     return parts
 
 
 # ─────────────────────────────────────────────
-# Extraction Metadata par REGEX (CROP OPTIMISÉ)
+# 3. Extraction Metadata (Regex - Page 1 Seule)
 # ─────────────────────────────────────────────
-
 def extract_metadata_regex(pdf_bytes: bytes, file_name: str) -> dict:
     """
-    Extrait les metadata en ne lisant QUE le haut de la première page.
-    Économise énormément de RAM en ignorant les tableaux de prix.
+    Extrait Client/Chantier/Devis via Regex.
+    Optimisation RAM : Ne lit que la PAGE 1 (texte brut).
     """
     text = ""
     try:
         with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf:
             if pdf.pages:
-                page = pdf.pages[0]
-                
-                # === OPTIMISATION MAJEURE ===
-                # On ne prend que les 60% du haut de la page.
-                # Cela couvre : Logo, En-tête, Destinataire, Chantier.
-                # Cela EXCLUT : La majorité des lignes de produits (lourdes).
-                width = page.width
-                height = page.height
-                crop_box = (0, 0, width, height * 0.60) # (x0, top, x1, bottom)
-                
-                cropped_page = page.within_bbox(crop_box)
-                text = cropped_page.extract_text() or ""
-                
+                # On lit juste la première page entière. 
+                # C'est sûr et peu gourmand (quelques Ko de texte).
+                text = pdf.pages[0].extract_text() or ""
     except Exception as e:
         logger.warning(f"Erreur lecture PDF {file_name}: {e}")
-        return {
-            "vendor_name": "INCONNU",
-            "project_name": "INCONNU",
-            "invoice_number": file_name.replace(".pdf", ""),
-        }
+        return {"vendor_name": "INCONNU", "project_name": "INCONNU", "invoice_number": file_name.replace(".pdf", "")}
     finally:
         gc.collect()
 
@@ -284,37 +239,35 @@ def extract_metadata_regex(pdf_bytes: bytes, file_name: str) -> dict:
                     break
     
     if vendor_name == "INCONNU":
-        found_qualidal_block = False
+        found_block = False
         for line in lines:
             line_stripped = line.strip()
             if "email" in line_stripped.lower() or "fax" in line_stripped.lower():
-                found_qualidal_block = True
+                found_block = True
                 continue
-            if found_qualidal_block and line_stripped:
-                is_uppercase = (line_stripped == line_stripped.upper())
-                is_clean = not any(kw in line_stripped for kw in [
-                    "DEVIS", "FACTURE", "TVA", "HT", "TTC", "PAGE", 
-                    "DATE", "TOTAL", "QUALIDAL", "CREIL", "CEDEX"
-                ])
-                if len(line_stripped) > 2 and len(line_stripped) < 50 and is_uppercase and is_clean:
+            if found_block and line_stripped:
+                is_upper = (line_stripped == line_stripped.upper())
+                is_clean = not any(kw in line_stripped for kw in ["DEVIS", "FACTURE", "TVA", "HT", "TOTAL", "QUALIDAL", "CREIL"])
+                if len(line_stripped) > 2 and len(line_stripped) < 50 and is_upper and is_clean:
                     vendor_name = line_stripped
                     break
 
-    # ── Project Name (chantier) ──
+    # ── Project Name (Logique Skip Lignes) ──
     project_name = "INCONNU"
     for i, line in enumerate(lines):
         line_stripped = line.strip()
         if "Chantier" in line_stripped:
+            # On regarde les 4 lignes suivantes
             for offset in range(1, 5):
                 if i + offset >= len(lines): break
                 next_line = lines[i + offset].strip()
                 if not next_line: continue
 
-                is_parasite = ("de l'offre" in next_line.lower() or 
-                               "validité" in next_line.lower() or
-                               "condition" in next_line.lower())
+                # Détection parasite
+                is_parasite = any(x in next_line.lower() for x in ["de l'offre", "validité", "condition"])
                 has_date = re.search(r"\d{2}/\d{2}/\d{4}", next_line)
                 
+                # Si parasite et pas de date, on saute
                 if is_parasite and not has_date: continue
 
                 if has_date:
@@ -333,9 +286,9 @@ def extract_metadata_regex(pdf_bytes: bytes, file_name: str) -> dict:
         if chantier_match:
             project_name = chantier_match.group(1).strip()
 
+    # Nettoyage final
     vendor_name = re.sub(r"[,;.\s]+$", "", vendor_name)[:100]
     project_name = re.sub(r"[,;.\s]+$", "", project_name)[:100]
-    
     for char in ['/', '\\', ':', '*', '?', '"', '<', '>', '|']:
         vendor_name = vendor_name.replace(char, '-')
         project_name = project_name.replace(char, '-')
@@ -352,284 +305,141 @@ def extract_metadata_regex(pdf_bytes: bytes, file_name: str) -> dict:
 # ─────────────────────────────────────────────
 
 SYSTEM_PROMPT = """\
-You are an expert document parser specialising in French invoices and quotes
-(devis, factures) for construction, building repair, and technical services.
-
-TASK:
-Given the raw text extracted from a PDF invoice or quote, return a single
-JSON object that matches the provided schema **exactly**.
-
-RULES FOR METADATA:
-1. `vendor_name`: The client/company name the document is billed to (e.g., 'EUROTECH CHAMPAGNE').
-2. `project_name`: The site location or project name, usually found under the table header 'Chantier' (e.g., 'TERRIA IMMO - Puiseux (62)' or 'LAGNY SUR MARNE (77)').
-3. `invoice_number`: YOU MUST FORMAT THIS STRICTLY AS 'devis_deXXXXXX' (all lowercase). 
-   For example, if you see 'DE00004894' or 'DE00005445' on the document, you MUST output 'devis_de00004894'.
-4. `date`: The document creation date. Convert strictly to YYYY-MM-DD format.
-5. `currency`: ISO 4217 code. Infer from symbols (€ → EUR).
-
-RULES FOR LINE ITEMS:
-1. Extract ONLY lines from the pricing table that have a quantity AND a unit price.
-2. For `designation`: use ONLY the short product/service name.
-   Do NOT include descriptions, technical details, or sub-text.
-   Examples:
-   - GOOD: "Réparation joint épaufré"
-   - BAD:  "Réparation joint épaufré : Sciage de part et d'autre..."
-3. NORMALIZE designations: Capitalize first letter of each significant word, fix typos.
-   Keep zone/area identifiers (e.g., "- Zone 1", "- Cellule A1").
-4. For `unite`: use the unit code as written (ML, M2, FORF, U, KG, etc.)
-5. For `unit_price`: price per unit excluding tax (PU HT)
-6. For `quantity`: the quantity (Qté)
-7. Do NOT extract section headers, sub-totals, or description paragraphs.
-
-RULES FOR TOTALS:
-1. Use values explicitly written in the document.
-2. `subtotal_ht`: Total before tax.
-3. `total_tax`: Total TVA amount.
-4. `total_ttc`: Grand total including tax.
-
-GENERAL RULES:
-- Monetary values MUST be plain floats.
-- If a field is truly absent, use "" for strings, 0.0 for numbers.
-- Never invent data.
+You are an expert document parser specialising in French invoices and quotes.
+TASK: Return a single JSON object matching the schema exactly.
+RULES:
+1. `vendor_name`: Client name.
+2. `project_name`: Site location/project name (under 'Chantier').
+3. `invoice_number`: Strictly 'devis_deXXXXXX'.
+4. `date`: YYYY-MM-DD.
+5. Extract ONLY lines with quantity AND unit price.
+6. `designation`: Short name only.
+7. `unite`: ML, M2, FORF, U, etc.
+8. No sub-totals or descriptions as items.
 """
 
 class InvoiceExtractor:
     def __init__(self):
         api_key = os.getenv("OPENAI_API_KEY")
-        if not api_key:
-            raise RuntimeError("OPENAI_API_KEY environment variable is not set")
+        if not api_key: raise RuntimeError("OPENAI_API_KEY missing")
         self.client = AsyncOpenAI(api_key=api_key)
         self.model = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
 
     async def extract(self, pdf_text: str) -> InvoiceData:
-        logger.info("Appel OpenAI (%s) avec %d caractères", self.model, len(pdf_text))
         max_chars = 60_000
-        if len(pdf_text) > max_chars:
-            pdf_text = pdf_text[:max_chars] + "\n\n[...TRUNCATED...]"
-
+        if len(pdf_text) > max_chars: pdf_text = pdf_text[:max_chars] + "\n[TRUNCATED]"
         response = await self.client.beta.chat.completions.parse(
             model=self.model,
             temperature=0,
-            messages=[
-                {"role": "system", "content": SYSTEM_PROMPT},
-                {"role": "user", "content": f"Extract data from this document:\n\n{pdf_text}"},
-            ],
+            messages=[{"role": "system", "content": SYSTEM_PROMPT}, {"role": "user", "content": pdf_text}],
             response_format=InvoiceData,
         )
-        parsed = response.choices[0].message.parsed
-        if parsed is None:
-            raise ValueError("OpenAI a renvoyé une réponse non analysable")
-        return parsed
+        return response.choices[0].message.parsed
 
 
 # ─────────────────────────────────────────────
-# FastAPI App
+# FastAPI App & Routes
 # ─────────────────────────────────────────────
 
-app = FastAPI(
-    title="Invoice Extraction & Split API",
-    version="10.3.0",
-    description="V10.3: Ultra-Light RAM Mode (Cropped Metadata Extraction).",
-)
-
-app.add_middleware(
-    CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"],
-)
+app = FastAPI(title="Invoice Extraction API", version="10.4.0")
+app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
 
 _extractor: Optional[InvoiceExtractor] = None
-
 def get_extractor() -> InvoiceExtractor:
     global _extractor
-    if _extractor is None:
-        _extractor = InvoiceExtractor()
+    if _extractor is None: _extractor = InvoiceExtractor()
     return _extractor
 
-@app.get("/")
-async def root():
-    return {"message": "API Active. Ultra-Low RAM mode."}
-
 @app.get("/health")
-async def health():
-    return {"status": "ok", "version": "10.3.0"}
+async def health(): return {"status": "ok", "version": "10.4.0"}
 
-
-# ─────────────────────────────────────────────
-# ROUTE 1: /split
-# ─────────────────────────────────────────────
+# Route 1: Split Seul
 @app.post("/split", response_model=SplitResponse)
 async def split_pdf(file: UploadFile = File(...)):
-    if file.content_type not in ("application/pdf", "application/octet-stream"):
-        raise HTTPException(status_code=400, detail="Expected a PDF file")
     try:
         content = await file.read()
         parts = split_pdf_into_parts(content)
-        del content
-        gc.collect()
-
-        results = [
-            SplitResult(
-                file_name=p["file_name"],
-                pdf_base64=base64.b64encode(p["pdf_bytes"]).decode("utf-8"),
-            )
-            for p in parts
-        ]
-        
-        del parts
-        gc.collect()
-        
+        del content; gc.collect()
+        results = [SplitResult(file_name=p["file_name"], pdf_base64=base64.b64encode(p["pdf_bytes"]).decode("utf-8")) for p in parts]
+        del parts; gc.collect()
         return SplitResponse(success=True, total_files=len(results), results=results)
     except Exception as e:
-        logger.exception("Erreur /split")
+        logger.exception("Error /split")
         return SplitResponse(success=False, error=str(e))
 
-
-# ─────────────────────────────────────────────
-# ROUTE 2: /extract
-# ─────────────────────────────────────────────
+# Route 2: Extract Seul
 @app.post("/extract", response_model=ExtractionResponse)
 async def extract_invoice(file: UploadFile = File(...)):
-    if file.content_type not in ("application/pdf", "application/octet-stream"):
-        raise HTTPException(status_code=400, detail="Expected a PDF file")
     try:
-        pdf_bytes = await file.read()
-        pdf_text = extract_text_from_pdf(pdf_bytes)
-        del pdf_bytes
-        gc.collect()
-
-        extractor = get_extractor()
-        invoice_data = await extractor.extract(pdf_text)
-        return ExtractionResponse(success=True, data=invoice_data)
+        content = await file.read()
+        text = extract_text_from_pdf(content)
+        del content; gc.collect()
+        data = await get_extractor().extract(text)
+        return ExtractionResponse(success=True, data=data)
     except Exception as e:
-        logger.exception("Erreur /extract")
+        logger.exception("Error /extract")
         return ExtractionResponse(success=False, error=str(e))
 
-
-# ─────────────────────────────────────────────
-# ROUTE 3: /split-light
-# ─────────────────────────────────────────────
+# Route 3: Split-Light (Votre route principale)
 @app.post("/split-light", response_model=SplitLightResponse)
 async def split_light(file: UploadFile = File(...)):
-    if file.content_type not in ("application/pdf", "application/octet-stream"):
-        raise HTTPException(status_code=400, detail="Expected a PDF file")
-
     try:
-        pdf_bytes = await file.read()
-        logger.info("=== SPLIT-LIGHT : Début ===")
+        content = await file.read()
+        parts = split_pdf_into_parts(content)
+        del content; gc.collect()
         
-        parts = split_pdf_into_parts(pdf_bytes)
-        del pdf_bytes
-        gc.collect()
+        results = []
+        errors = []
         
-        logger.info(f"{len(parts)} devis détectés")
-
-        results: list[SplitLightItem] = []
-        errors: list[dict] = []
-
         for part in parts:
             try:
-                # C'est ici que l'optimisation joue : on ne lit que le haut de page
+                # Metadata sur Page 1 uniquement
                 meta = extract_metadata_regex(part["pdf_bytes"], part["file_name"])
-
-                vendor_name = meta["vendor_name"]
-                project_name = meta["project_name"]
-                invoice_number = meta["invoice_number"]
-
-                letter = vendor_name[0].upper() if vendor_name and vendor_name[0].isalpha() else "#"
-                base_folder = "/TEST"
-                drive_path = f"{base_folder}/{letter}/{vendor_name}/{project_name}/Devis et commande/{invoice_number}.pdf"
-
-                pdf_base64 = base64.b64encode(part["pdf_bytes"]).decode("utf-8")
-
+                
+                vendor = meta["vendor_name"]
+                project = meta["project_name"]
+                inv_num = meta["invoice_number"]
+                
+                letter = vendor[0].upper() if vendor and vendor[0].isalpha() else "#"
+                path = f"/TEST/{letter}/{vendor}/{project}/Devis et commande/{inv_num}.pdf"
+                
+                b64 = base64.b64encode(part["pdf_bytes"]).decode("utf-8")
                 results.append(SplitLightItem(
-                    file_name=part["file_name"],
-                    pdf_base64=pdf_base64,
-                    vendor_name=vendor_name,
-                    project_name=project_name,
-                    invoice_number=invoice_number,
-                    drive_path=drive_path,
+                    file_name=part["file_name"], pdf_base64=b64,
+                    vendor_name=vendor, project_name=project, invoice_number=inv_num, drive_path=path
                 ))
             except Exception as e:
-                logger.warning(f"  ❌ {part['file_name']}: {e}")
-                errors.append({
-                    "file_name": part["file_name"],
-                    "error": str(e),
-                })
+                errors.append({"file_name": part["file_name"], "error": str(e)})
         
-        del parts
-        gc.collect()
-
-        logger.info(f"=== SPLIT-LIGHT TERMINÉ : {len(results)} OK ===")
-
-        return SplitLightResponse(
-            success=True,
-            total_files=len(results),
-            results=results,
-            errors=errors,
-        )
-
+        del parts; gc.collect()
+        return SplitLightResponse(success=True, total_files=len(results), results=results, errors=errors)
     except Exception as e:
-        logger.exception("Erreur /split-light")
+        logger.exception("Error /split-light")
         return SplitLightResponse(success=False, error=str(e))
 
-
-# ─────────────────────────────────────────────
-# ROUTE 4: /split-and-extract
-# ─────────────────────────────────────────────
+# Route 4: Split + Extract
 @app.post("/split-and-extract", response_model=SplitExtractResponse)
 async def split_and_extract(file: UploadFile = File(...)):
-    if file.content_type not in ("application/pdf", "application/octet-stream"):
-        raise HTTPException(status_code=400, detail="Expected a PDF file")
-
     try:
-        pdf_bytes = await file.read()
-        parts = split_pdf_into_parts(pdf_bytes)
-        del pdf_bytes
-        gc.collect()
+        content = await file.read()
+        parts = split_pdf_into_parts(content)
+        del content; gc.collect()
         
-        total_found = len(parts)
-        if total_found == 0:
-            return SplitExtractResponse(success=False, error="Aucun devis détecté")
-
+        results = []
+        errors = []
         extractor = get_extractor()
-        results: list[SplitExtractItem] = []
-        errors: list[SplitExtractError] = []
 
         for part in parts:
             try:
-                pdf_text = extract_text_from_pdf(part["pdf_bytes"])
-                invoice_data = await extractor.extract(pdf_text)
-                
-                pdf_base64 = base64.b64encode(part["pdf_bytes"]).decode("utf-8")
-                
-                results.append(SplitExtractItem(
-                    file_name=part["file_name"],
-                    pdf_base64=pdf_base64,
-                    extraction=invoice_data,
-                ))
-                del pdf_text
-                gc.collect()
-                
+                text = extract_text_from_pdf(part["pdf_bytes"])
+                data = await extractor.extract(text)
+                b64 = base64.b64encode(part["pdf_bytes"]).decode("utf-8")
+                results.append(SplitExtractItem(file_name=part["file_name"], pdf_base64=b64, extraction=data))
+                del text; gc.collect()
             except Exception as e:
-                logger.warning(f"  ❌ {part['file_name']}: {e}")
-                errors.append(SplitExtractError(
-                    file_name=part["file_name"],
-                    error=str(e),
-                    page_start=part["page_start"],
-                    page_end=part["page_end"],
-                ))
+                errors.append(SplitExtractError(file_name=part["file_name"], error=str(e), page_start=part["page_start"], page_end=part["page_end"]))
 
-        del parts
-        gc.collect()
-
-        return SplitExtractResponse(
-            success=True,
-            total_found=total_found,
-            total_extracted=len(results),
-            total_errors=len(errors),
-            results=results,
-            errors=errors,
-        )
-
+        del parts; gc.collect()
+        return SplitExtractResponse(success=True, total_found=len(results)+len(errors), total_extracted=len(results), total_errors=len(errors), results=results, errors=errors)
     except Exception as e:
-        logger.exception("Erreur /split-and-extract")
         return SplitExtractResponse(success=False, error=str(e))

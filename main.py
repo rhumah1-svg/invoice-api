@@ -401,7 +401,7 @@ async def split_light(file: UploadFile = File(...)):
                 inv_num = meta["invoice_number"]
                 
                 letter = vendor[0].upper() if vendor and vendor[0].isalpha() else "#"
-                path = f"/TEST/{letter}/{vendor}/{project}/Devis et commande/{inv_num}.pdf"
+                path = f"/split dossier/{letter}/{vendor}/{project}/Devis et commande/{inv_num}.pdf"
                 
                 b64 = base64.b64encode(part["pdf_bytes"]).decode("utf-8")
                 results.append(SplitLightItem(

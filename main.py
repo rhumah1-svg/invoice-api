@@ -10,6 +10,7 @@ Base : V10.8. Modifications minimales et ciblées :
 """
 
 import os, io, logging, base64, re, gc, json
+import httpx
 from typing import Optional
 
 import pdfplumber
@@ -61,9 +62,10 @@ class InvoiceData(BaseModel):
     totals:     Totals
 
 class ExtractionResponse(BaseModel):
-    success: bool
-    data:    Optional[InvoiceData] = None
-    error:   Optional[str]        = None
+    success:  bool
+    data:     Optional[InvoiceData] = None
+    error:    Optional[str]         = None
+    file_url: Optional[str]         = None
 
 class SplitResult(BaseModel):
     file_name:  str
@@ -733,6 +735,36 @@ def get_openai_client() -> AsyncOpenAI:
     return AsyncOpenAI(api_key=key)
 
 
+# ── Upload PDF vers Bubble File Storage ─────────────────────────────────────
+async def upload_pdf_to_bubble(pdf_bytes: bytes, filename: str) -> str:
+    """
+    Upload un PDF vers Bubble File Storage.
+    Retourne l URL S3 du fichier stocké, ou "" en cas d erreur.
+    """
+    bubble_token = os.getenv("BUBBLE_API_KEY", "")
+    bubble_base  = os.getenv("BUBBLE_BASE_URL", "https://www.portail-qualidal.com/version-test")
+    upload_url   = f"{bubble_base}/api/1.1/files/uploadprivate"
+
+    if not bubble_token:
+        logger.warning("BUBBLE_API_KEY manquant — upload PDF ignoré")
+        return ""
+
+    try:
+        async with httpx.AsyncClient(timeout=60) as client:
+            resp = await client.post(
+                upload_url,
+                headers={"Authorization": f"Bearer {bubble_token}"},
+                files={"file": (filename, pdf_bytes, "application/pdf")},
+            )
+            resp.raise_for_status()
+            file_url = resp.json().get("fileUrl", "")
+            logger.info(f"PDF uploadé vers Bubble : {file_url[:80]}...")
+            return file_url
+    except Exception as e:
+        logger.warning(f"Upload PDF Bubble échoué : {e}")
+        return ""
+
+
 @app.get("/health")
 async def health():
     return {"status": "ok", "version": "11.0.0"}
@@ -759,10 +791,14 @@ async def split_pdf(file: UploadFile = File(...)):
 @app.post("/extract", response_model=ExtractionResponse)
 async def extract_invoice(file: UploadFile = File(...)):
     try:
-        content = await file.read()
-        data    = await extract_with_vision(content, get_openai_client())
-        del content; gc.collect()
-        return ExtractionResponse(success=True, data=data)
+        pdf_bytes = await file.read()
+        filename  = file.filename or "devis.pdf"
+        # Extraction IA
+        data      = await extract_with_vision(pdf_bytes, get_openai_client())
+        # Upload vers Bubble File Storage
+        file_url  = await upload_pdf_to_bubble(pdf_bytes, filename)
+        del pdf_bytes; gc.collect()
+        return ExtractionResponse(success=True, data=data, file_url=file_url)
     except HTTPException as e:
         return ExtractionResponse(success=False, error=e.detail)
     except Exception as e:

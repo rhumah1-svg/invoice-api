@@ -359,7 +359,16 @@ Un item valide est une ligne du tableau des prestations qui remplit AU MOINS UNE
 Ne PAS créer d'item pour :
   • Lignes entièrement à 0,00 (séparateurs visuels vides)
   • Sous-totaux ou totaux intermédiaires
-  • Lignes de type "section" sans quantité ni prix (ex: "Installation et livraison chantier :")
+  • Titres de sous-section sans quantité ET sans prix
+    (ex: "Installation et livraison chantier :", "Préparation de surface :", "Contrôles de réception:")
+    Ces lignes font partie de la description de l'item qui les précède.
+
+  RÈGLE ABSOLUE — Le prix prime sur tout le reste :
+    Si une ligne a P.U. HT ≠ 0 OU Montant HT ≠ 0, c'est un item facturable.
+    Même si la ligne commence par un tiret "- ".
+    Même si le texte est court ("- Amené et repli du matériel").
+    Même si ça ressemble à un sous-item.
+    → Toujours créer un item pour ces lignes.
   • Conditions générales (voir liste ci-dessous)
   • La ligne de total général (Total HT, Total TVA, Total TTC)
 
@@ -399,6 +408,10 @@ Ne PAS inclure dans description (ces textes sont des CGV, pas des prestations) :
   • Les mentions légales (Siret, RCS, capital)
   • "Devis gratuit. Les prix TTC sont établis..."
   • Les pénalités de retard de paiement
+  • Toute condition de paiement / acompte (ex: "Acompte de 30% à la commande",
+    "Solde à réception", "Paiement à 45 jours", "VIREMENT 30 JOURS")
+  • Les délais d'exécution ou de livraison
+  • Les mentions "BON POUR ACCORD", "Cachet + signature"
 
 Pour une remise/ristourne : description = "" (chaîne vide)
 

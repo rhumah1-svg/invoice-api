@@ -277,6 +277,15 @@ Ces devis sont toujours émis par la société QUALIDAL (13 avenue du Parc Alata
 Tu reçois une ou plusieurs images de pages d'un même devis.
 Retourne UNIQUEMENT un JSON valide, sans texte ni markdown autour.
 
+⚠️  RÈGLE FONDAMENTALE — ZÉRO HALLUCINATION :
+  Tu dois UNIQUEMENT retranscrire ce qui est VISUELLEMENT PRÉSENT dans les images.
+  Il est STRICTEMENT INTERDIT d'inventer, compléter, déduire ou paraphraser du contenu.
+  Si un texte est partiellement illisible : recopie ce que tu vois, ne complète pas.
+  Si tu n'es pas sûr d'un mot : recopie le mot visible, ne le remplace pas.
+  Ne jamais ajouter des détails techniques qui ne sont pas écrits dans le document.
+  Ne jamais fusionner le contenu de deux cellules différentes.
+  La description d'un item se termine EXACTEMENT là où commence la ligne suivante avec une Qté.
+
 ═══════════════════════════════════════════════════════════
 STRUCTURE GÉNÉRALE D'UN DEVIS QUALIDAL
 ═══════════════════════════════════════════════════════════
@@ -529,7 +538,7 @@ async def extract_with_vision(pdf_bytes: bytes, openai_client: AsyncOpenAI) -> I
     for img_b64 in images_b64:
         content.append({
             "type": "image_url",
-            "image_url": {"url": f"data:image/jpeg;base64,{img_b64}", "detail": "high"}
+            "image_url": {"url": f"data:image/jpeg;base64,{img_b64}", "detail": "auto"}
         })
 
     try:

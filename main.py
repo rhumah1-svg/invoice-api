@@ -490,6 +490,128 @@ Lire les valeurs dans le tableau de totaux en bas de dernière page.
 Si une valeur est absente : 0.0
 
 ═══════════════════════════════════════════════════════════
+EXEMPLES RÉELS — FEW-SHOT (basés sur de vrais devis Qualidal)
+═══════════════════════════════════════════════════════════
+
+Ces exemples montrent exactement ce qui est attendu.
+
+── Exemple A — Titre de section/zone sans prix → IGNORÉ ──────
+Sur le devis COGESTRA (DE00005468), la ligne suivante apparaît :
+  "LTM/WARNING   0,00   0,00   0,00   0,00"
+  "ACP            0,00   0,00   0,00   0,00"
+→ Ce sont des titres de zone. Tous les champs = 0. NE PAS créer d item.
+  Même chose pour "Commande : L.25-080" sur le devis LIZSOL.
+
+── Exemple B — Item simple avec designation en MAJUSCULES ────
+Ligne du devis LIZSOL (DE00005573) :
+  "ÉPROUVETTES SUPPLÉMENTAIRES   28,00   UNIT   22,00   616,00"
+  "3 supplémentaires en compression (à 28 jours) x 7 jours
+   1 supplémentaires en fendage (à 28 jours) x 7 jours"
+→ Sortie attendue :
+{
+  "designation": "Éprouvettes supplémentaires",
+  "description": "3 supplémentaires en compression (à 28 jours) x 7 jours. 1 supplémentaires en fendage (à 28 jours) x 7 jours",
+  "quantity": 28.0,
+  "unite": "U",
+  "unit_price": 22.0
+}
+
+── Exemple C — Item avec designation en gras suivi de description ──
+Ligne du devis COGESTRA (DE00005468) :
+  "Réparation épaufrures :   80,00   ML   125,00   10 000,00"
+  "Sciage de part et d autre de l épaufrure sur largeur requise..."
+→ Sortie attendue :
+{
+  "designation": "Réparation épaufrures",
+  "description": "Sciage de part et d autre de l épaufrure sur largeur requise et profondeur de 15 mm, piquage, nettoyage, aspiration, application d un primaire d accrochage et application d un mortier de résine sans retrait. Surfaçage et reconstitution du joint, le cas échéant.",
+  "quantity": 80.0,
+  "unite": "ML",
+  "unit_price": 125.0
+}
+
+── Exemple D — Item avec listes à tirets dans description ────
+Ligne du devis COGESTRA :
+  "Bords des regards :   2,00   UNIT   525,00   1 050,00"
+  "- Sciage périphérique autour du tampon et du regard
+   - Piochage et évacuation des gravats
+   - Recalage du tampon
+   - Scellement du tampon par mortier de résine
+   - Reprise de l ensemble au mortier de résine"
+→ Sortie attendue :
+{
+  "designation": "Bords des regards",
+  "description": "- Sciage périphérique autour du tampon et du regard - Piochage et évacuation des gravats - Recalage du tampon - Scellement du tampon par mortier de résine - Reprise de l ensemble au mortier de résine",
+  "quantity": 2.0,
+  "unite": "U",
+  "unit_price": 525.0
+}
+
+── Exemple E — Description très longue avec sous-sections titrées ──
+Ligne du devis Autostore (DE00004001) :
+  "Mise en conformité de la dalle...   815,00   M2   102,00   83 130,00"
+  Suivi d un très long bloc avec sous-titres en gras : Installation et
+  livraison chantier :, Préparation de surface :, Application coulis
+  hydraulique, Contrôles de réception:
+→ Sortie attendue :
+{
+  "designation": "Mise en conformité dalle coulis hydraulique Autostore",
+  "description": "Mise en conformité de la dalle, par application d un coulis hydraulique conformément aux spécifications AUTOSTORE. 800m². Installation et livraison chantier : - Amené et repli du matériel - Installation de barrières et bâches de protection - Nettoyage de la zone en fin de chantier. Préparation de surface : - Grenaillage de la surface - Application d un primaire d accrochage sablé - Installation de coffrages et traitement des trous, impacts, joints et fissures - Mise en place de boulons réglés à +/- 0.5 mm respectant un maillage de 1.5 x 1.5 m². Application coulis hydraulique : - transport et mise en oeuvre du matériau par camion pompe - Réglage et finition conformément à la norme NF EN 13813, de type P4S avec résistance à l abrasion ARO.5. Contrôles de réception : - Scanner 3D de la surface - Essai de friction / glissance - Essai résistivité électrique",
+  "quantity": 815.0,
+  "unite": "M2",
+  "unit_price": 102.0
+}
+
+── Exemple F — Description avec liste entre parenthèses (pas de confusion items) ──
+Ligne du devis OFFICE DEPOT (DE00001632) :
+  "MISSION DE CAROTTAGE - zone 1 - comprenant : 6 carottes...   1,00   FORF   736,00"
+  Description longue avec (Homogénéité du béton, présence de treillis soudé,
+  diamètre du fil, présence de fibres, type de fibres : Métallique - Synthétiques...)
+→ Les virgules dans les parenthèses NE séparent PAS des items différents.
+→ Sortie attendue :
+{
+  "designation": "Mission de carottage Zone 1",
+  "description": "6 carottes réparties sur l ensemble de la surface. Rédaction d un rapport comprenant la méthodologie, un plan d implantation des carottes, un diagnostic visuel (Homogénéité du béton, présence de treillis soudé, diamètre du fil, présence de fibres, type de fibres : Métallique - Synthétiques, Homogénéité des fibres, présence d air occlus, diamètre des bulles d air, diamètre des agrégats, épaisseur de la couche d usure, type de couche d usure : coulis - saupoudrage), une série de photos. Y compris rebouchage des trous de carottes par mortier hydraulique à retrait compensé.",
+  "quantity": 1.0,
+  "unite": "FORF",
+  "unit_price": 736.0
+}
+
+── Exemple G — Remise (prix négatif, description vide) ───────
+Ligne du devis Autostore :
+  "Remise exceptionnelle   1,00   FORF   -130,00   -130,00"
+→ Sortie attendue :
+{
+  "designation": "Remise exceptionnelle",
+  "description": "",
+  "quantity": 1.0,
+  "unite": "FORF",
+  "unit_price": -130.0
+}
+
+── Exemple H — Suivi avec dates en tirets dans description ───
+Ligne du devis LIZSOL :
+  "SUIVI DE COULAGE - zone 1   7,00   FORF   459,00   3 213,00"
+  Suivi de : "Inclus slump tests, 1 E/C, 3 tests de fibres..."
+  Puis dates : "- 25/02/2026 - 26/02/2026 - 27/02/2026..."
+→ Les dates en tirets font partie de la description, PAS des items séparés.
+→ Sortie attendue :
+{
+  "designation": "Suivi de coulage - Zone 1",
+  "description": "Inclus slump tests, 1 E/C, 3 tests de fibres, confection de 6 éprouvettes essais et envoi des rapports. Détails : 3 éprouvettes à 07 jours en compression, 3 éprouvettes à 14 jours en compression. - 25/02/2026 - 26/02/2026 - 27/02/2026 - 05/03/2026 - 06/03/2026 - 09/03/2026 - 10/03/2026",
+  "quantity": 7.0,
+  "unite": "FORF",
+  "unit_price": 459.0
+}
+
+── Exemple I — Ligne à exclure (CGV / conditions à 0,00) ─────
+Sur le devis COGESTRA page 2 :
+  "Acompte de 30% à la commande   0,00   0,00   0,00   0,00"
+  "Plus-value pour travail le samedi (30%)"
+  "Travaux réalisés en semaine du lundi au vendredi..."
+  "La société QUALIDAL n est pas responsable..."
+→ Tous ces blocs ont Qté=0 et prix=0. Ce sont des CGV. NE PAS créer d items.
+
+═══════════════════════════════════════════════════════════
 FORMAT DE SORTIE — JSON STRICT, SANS MARKDOWN
 ═══════════════════════════════════════════════════════════
 

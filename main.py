@@ -377,6 +377,9 @@ Ne PAS créer d'item pour :
     Même si la ligne commence par un tiret "- ".
     Même si le texte est court ("- Amené et repli du matériel").
     Même si ça ressemble à un sous-item.
+    Même si le texte n'est PAS en gras (contrairement aux autres items du même devis).
+    Même si la designation est une phrase longue en texte normal.
+    → Le style typographique (gras/normal/italique) n'est JAMAIS un critère d'exclusion.
     → Toujours créer un item pour ces lignes.
   • Conditions générales (voir liste ci-dessous)
   • La ligne de total général (Total HT, Total TVA, Total TTC)
@@ -601,6 +604,22 @@ Ligne du devis LIZSOL :
   "quantity": 7.0,
   "unite": "FORF",
   "unit_price": 459.0
+}
+
+── Exemple J — Item en texte normal (non gras) avec prix sur même ligne ──
+Sur ce devis COGESTRA (DE00005468), TOUS les autres items ont leur designation
+en GRAS. Mais cet item est en texte normal :
+  "Fourniture d'une benne pour l'évacuation et le traitement des déchets.   1,00   FORF   900,00   900,00"
+  "Emplacement à convenir le plus proche possible de la zone de travail."
+→ Même si ce n'est PAS en gras, c'est un item valide car il a Qté=1 et P.U. HT=900.
+→ RÈGLE : le style gras/normal n'est pas un critère. Seul le prix compte.
+→ Sortie attendue :
+{
+  "designation": "Fourniture benne évacuation déchets",
+  "description": "Fourniture d'une benne pour l'évacuation et le traitement des déchets. Emplacement à convenir le plus proche possible de la zone de travail.",
+  "quantity": 1.0,
+  "unite": "FORF",
+  "unit_price": 900.0
 }
 
 ── Exemple I — Ligne à exclure (CGV / conditions à 0,00) ─────

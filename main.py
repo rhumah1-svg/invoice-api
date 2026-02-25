@@ -404,6 +404,19 @@ Si la prestation est une remise/ristourne/escompte :
 Conserver les identifiants de zone s'ils sont présents :
   Ex: "Grenaillage surface - Zone 1", "Ragréage béton - Cellule A3"
 
+RÈGLE SPÉCIALE — designation sans deux-points :
+  Certaines designations n'ont PAS de deux-points à la fin (contrairement à la majorité).
+  Exemples : "Impact", "Fourniture d'une benne...", "Amené et repli du matériel"
+  → Ce sont des items valides exactement comme les autres.
+  → Ne pas les ignorer sous prétexte que la désignation ne finit pas par ":".
+
+RÈGLE SPÉCIALE — designation avec parenthèses informatives :
+  Certaines designations contiennent des précisions entre parenthèses.
+  Ex: "Réparation seuil de porte : (2 unités à 4ml)"
+  → La designation est le texte AVANT la parenthèse : "Réparation seuil de porte"
+  → La quantity vient de la colonne Qté du tableau, PAS du chiffre dans la parenthèse.
+  → Les informations entre parenthèses peuvent figurer dans la description si pertinentes.
+
 ── description ─────────────────────────────────────────────
 
 Règle : copier FIDÈLEMENT tout le texte de la cellule Description pour cet item.
@@ -435,6 +448,10 @@ Valeur numérique de la colonne Qté.
 Si la colonne est vide ou absente : 0.0
 Toujours un float : 1 → 1.0, 815 → 815.0
 
+ATTENTION : quand une designation contient un nombre entre parenthèses
+(ex: "Réparation seuil de porte : (2 unités à 4ml)"), la quantity est
+TOUJOURS la valeur de la colonne Qté du tableau, pas le chiffre dans la parenthèse.
+
 ── unite ───────────────────────────────────────────────────
 
 Normaliser selon ce tableau :
@@ -444,7 +461,7 @@ Normaliser selon ce tableau :
   H / Heure / Heures / HR                  → "Heures"
   J / Jour / Jours                         → "Jours"
   Sem / Semaine                             → "Semaine"
-  U / unité / pce / pièce / ens (ambigu)   → "U"
+  U / unité / pce / pièce / UNIT / ens      → "U"
   Vide ou non reconnu                       → "U"
 
 ── unit_price ──────────────────────────────────────────────
@@ -608,6 +625,14 @@ Ligne du devis LIZSOL :
   "unit_price": 459.0
 }
 
+── Exemple I — Ligne à exclure (CGV / conditions à 0,00) ─────
+Sur le devis COGESTRA page 2 :
+  "Acompte de 30% à la commande   0,00   0,00   0,00   0,00"
+  "Plus-value pour travail le samedi (30%)"
+  "Travaux réalisés en semaine du lundi au vendredi..."
+  "La société QUALIDAL n est pas responsable..."
+→ Tous ces blocs ont Qté=0 et prix=0. Ce sont des CGV. NE PAS créer d items.
+
 ── Exemple J — Item en texte normal (non gras) avec prix sur même ligne ──
 Sur ce devis COGESTRA (DE00005468), TOUS les autres items ont leur designation
 en GRAS. Mais cet item est en texte normal :
@@ -624,13 +649,46 @@ en GRAS. Mais cet item est en texte normal :
   "unit_price": 900.0
 }
 
-── Exemple I — Ligne à exclure (CGV / conditions à 0,00) ─────
-Sur le devis COGESTRA page 2 :
-  "Acompte de 30% à la commande   0,00   0,00   0,00   0,00"
-  "Plus-value pour travail le samedi (30%)"
-  "Travaux réalisés en semaine du lundi au vendredi..."
-  "La société QUALIDAL n est pas responsable..."
-→ Tous ces blocs ont Qté=0 et prix=0. Ce sont des CGV. NE PAS créer d items.
+── Exemple K — Item avec designation SANS deux-points (texte court non gras) ──
+Sur le devis IVANHOE LOGISTIQUE BONDOUFLE (DE00004894), dans la Cellule A2 :
+  "Impact   2,00   UNIT   120,00   240,00"
+  "Réparation en mortier de résine (30x30). Sciage périphérique de l'épaufrure
+   sur largeur et profondeur requise, piquage, nettoyage, aspiration,
+   application d'un primaire d'accrochage et application d'un mortier de résine
+   sans retrait. Surfaçage final si nécessaire."
+→ "Impact" est une designation VALIDE même si :
+   • Elle ne se termine PAS par un deux-points ":"
+   • Elle est courte (un seul mot)
+   • Elle n'est PAS en gras dans ce devis
+→ Critère unique : P.U. HT = 120,00 ≠ 0 → ITEM OBLIGATOIRE.
+→ Sortie attendue :
+{
+  "designation": "Impact - Cellule A2",
+  "description": "Réparation en mortier de résine (30x30). Sciage périphérique de l épaufrure sur largeur et profondeur requise, piquage, nettoyage, aspiration, application d un primaire d accrochage et application d un mortier de résine sans retrait. Surfaçage final si nécessaire.",
+  "quantity": 2.0,
+  "unite": "U",
+  "unit_price": 120.0
+}
+
+── Exemple L — Designation avec parenthèse informative — quantity depuis colonne Qté ──
+Sur le devis IVANHOE LOGISTIQUE BONDOUFLE (DE00004894), dans la Cellule A3 :
+  "Réparation seuil de porte : (2 unités à 4ml)   2,00   UNIT   230,00   460,00"
+  "Sciage de part et d autre du seuil sur largeur et profondeur requise,
+   piquage, nettoyage, aspiration, application d un primaire d accrochage et
+   application d un mortier de résine sans retrait. Surfaçage final si nécessaire."
+→ La parenthèse "(2 unités à 4ml)" est une PRÉCISION informative dans la designation.
+   Elle ne crée pas d'items séparés. Elle n'est PAS la source de quantity.
+→ designation : texte avant la parenthèse, nettoyé → "Réparation seuil de porte"
+→ quantity    : valeur de la colonne Qté = 2,00  (PAS le "2" dans la parenthèse)
+→ La mention "(2 unités à 4ml)" peut être intégrée dans la description.
+→ Sortie attendue :
+{
+  "designation": "Réparation seuil de porte - Cellule A3",
+  "description": "(2 unités à 4ml). Sciage de part et d autre du seuil sur largeur et profondeur requise, piquage, nettoyage, aspiration, application d un primaire d accrochage et application d un mortier de résine sans retrait. Surfaçage final si nécessaire.",
+  "quantity": 2.0,
+  "unite": "U",
+  "unit_price": 230.0
+}
 
 ═══════════════════════════════════════════════════════════
 FORMAT DE SORTIE — JSON STRICT, SANS MARKDOWN

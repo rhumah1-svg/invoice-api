@@ -671,16 +671,25 @@ Sur le devis IVANHOE LOGISTIQUE BONDOUFLE (DE00004894), dans la Cellule A2 :
 }
 
 ── Exemple L — Designation avec parenthèse informative — quantity depuis colonne Qté ──
-Sur le devis IVANHOE LOGISTIQUE BONDOUFLE (DE00004894), dans la Cellule A3 :
-  "Réparation seuil de porte : (2 unités à 4ml)   2,00   UNIT   230,00   460,00"
-  "Sciage de part et d autre du seuil sur largeur et profondeur requise,
-   piquage, nettoyage, aspiration, application d un primaire d accrochage et
-   application d un mortier de résine sans retrait. Surfaçage final si nécessaire."
-→ La parenthèse "(2 unités à 4ml)" est une PRÉCISION informative dans la designation.
-   Elle ne crée pas d'items séparés. Elle n'est PAS la source de quantity.
-→ designation : texte avant la parenthèse, nettoyé → "Réparation seuil de porte"
-→ quantity    : valeur de la colonne Qté = 2,00  (PAS le "2" dans la parenthèse)
-→ La mention "(2 unités à 4ml)" peut être intégrée dans la description.
+Sur le devis IVANHOE LOGISTIQUE BONDOUFLE (DE00004894), dans la Cellule A3,
+la ligne du tableau apparaît EXACTEMENT ainsi (tout sur une seule ligne) :
+  "Réparation seuil de porte : (2 unités à 4ml) 2,00 UNIT 230,00 460,00 20,00"
+
+Décomposition colonne par colonne :
+  [DESCRIPTION                                  ] [Qté ] [U   ] [P.U.  ] [Montant] [TVA]
+  "Réparation seuil de porte : (2 unités à 4ml)"   2,00   UNIT   230,00   460,00   20,00
+
+⚠️  PIÈGE FRÉQUENT : le "2" dans "(2 unités à 4ml)" fait partie du TEXTE de la
+   description, ce n'est PAS la colonne Qté.
+→ La vraie colonne Qté est le "2,00" qui apparaît APRÈS la fermeture de parenthèse ")".
+→ La parenthèse entière "(2 unités à 4ml)" est une précision informative sur la prestation,
+   pas une quantité, pas un item séparé.
+
+→ designation : "Réparation seuil de porte - Cellule A3"
+→ quantity    : 2.0   ← valeur de la colonne Qté, après ")", PAS le chiffre dans la parenthèse
+→ unite       : "U"   ← UNIT normalisé
+→ unit_price  : 230.0
+
 → Sortie attendue :
 {
   "designation": "Réparation seuil de porte - Cellule A3",

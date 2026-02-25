@@ -279,430 +279,85 @@ Ces devis sont toujours émis par la société QUALIDAL (13 avenue du Parc Alata
 Tu reçois une ou plusieurs images de pages d'un même devis.
 Retourne UNIQUEMENT un JSON valide, sans texte ni markdown autour.
 
-⚠️  RÈGLE FONDAMENTALE — ZÉRO HALLUCINATION :
-  Tu dois UNIQUEMENT retranscrire ce qui est VISUELLEMENT PRÉSENT dans les images.
-  Il est STRICTEMENT INTERDIT d'inventer, compléter, déduire ou paraphraser du contenu.
-  Si un texte est partiellement illisible : recopie ce que tu vois, ne complète pas.
-  Si tu n'es pas sûr d'un mot : recopie le mot visible, ne le remplace pas.
-  Ne jamais ajouter des détails techniques qui ne sont pas écrits dans le document.
-  Ne jamais fusionner le contenu de deux cellules différentes.
+⚠️ RÈGLE FONDAMENTALE — ZÉRO HALLUCINATION :
+  Tu dois UNIQUEMENT retranscrire ce qui est VISUELLEMENT PRÉSENT.
+  Il est STRICTEMENT INTERDIT d'inventer, de déduire ou de paraphraser.
+  Ne jamais fusionner le contenu de deux lignes facturables différentes.
   La description d'un item se termine EXACTEMENT là où commence la ligne suivante avec une Qté.
-
-═══════════════════════════════════════════════════════════
-STRUCTURE GÉNÉRALE D'UN DEVIS QUALIDAL
-═══════════════════════════════════════════════════════════
-
-Page 1 en-tête (haut gauche) : logo + adresse Qualidal
-Page 1 en-tête (haut droite) : destinataire → "Monsieur/Madame Prénom NOM" puis nom entreprise
-Tableau récapitulatif       : colonnes Chantier | Date | Date validité | Condition règlement | N° TVA
-Tableau des prestations     : colonnes Description | Qté | U | P.U. HT | (R%) | Montant HT | TVA
-Dernière page bas           : Totaux + "Adresse du chantier" + "BON POUR ACCORD"
-
-Le tableau des prestations peut s'étendre sur plusieurs pages.
-La colonne R% (remise) peut être absente.
-Il peut y avoir des sous-totaux ou des séparateurs de zones (ex: "Zone 1", "Cellule A").
 
 ═══════════════════════════════════════════════════════════
 RÈGLE 1 — vendor_name (entreprise CLIENTE)
 ═══════════════════════════════════════════════════════════
-
-C'est l'entreprise À QUI le devis est adressé. Jamais Qualidal.
-
-Méthode principale :
-  Repère "Monsieur", "Madame", "M.", "Mme" suivi d'un prénom et nom.
-  La ligne SUIVANTE est le nom de l'entreprise cliente.
-  Ex: "Monsieur Jean-Eudes Gohard" → ligne suivante → "IDEC"
-
-Méthode fallback (si pas de civilité) :
-  Après le bloc Qualidal (après "Email :" ou "Fax :"),
-  chercher la première ligne en majuscules qui n'est pas :
-  une adresse, un numéro de téléphone, "DEVIS", "FACTURE", ou une ville connue.
+C'est le destinataire du devis (en haut à droite, ou sous les infos QUALIDAL).
+- Repère le bloc d'adresse destinataire.
+- Prends TOUTES les lignes désignant l'entité avant l'adresse physique (rue).
+- Si tu vois la mention "C/O" (Care Of), inclus la ligne précédente ET la ligne "C/O".
+  Ex: "IVANHOE LOGISTIQUE BONDOUFLE / C/O COGESTRA" -> extraire "IVANHOE LOGISTIQUE BONDOUFLE - C/O COGESTRA".
 
 ═══════════════════════════════════════════════════════════
 RÈGLE 2 — project_name (chantier)
 ═══════════════════════════════════════════════════════════
-
-Source primaire : valeur de la colonne "Chantier" dans le tableau récapitulatif.
-
-Cas 1 — valeur explicite et complète :
-  "AREFIM - REIMS (51)" → garder tel quel
-  "LOZENNES (59)" → garder tel quel
-
-Cas 2 — valeur courte ou nom propre seul (ex: "Autostore", "Amazon", "Lidl") :
-  Chercher "Adresse du chantier" ou "Ref Cde" en bas de page pour compléter.
-  Ex: Chantier="Autostore" + Adresse="Ussel" + Ref="Projet Autostore Ussel (19)" → "Autostore Ussel (19)"
-  Ex: Chantier="Autostore" + Adresse="Ussel" (sans département) → "Autostore Ussel"
-
-Cas 3 — valeur vide :
-  Utiliser "Ref Cde" si présent, sinon "INCONNU"
+Valeur exacte de la colonne "Chantier" dans le tableau récapitulatif.
+Si la valeur est très courte (ex: "Autostore"), complète avec la mention "Adresse du chantier" en bas de page.
+Si absent, cherche "Ref Cde :" en haut.
 
 ═══════════════════════════════════════════════════════════
-RÈGLE 3 — invoice_number
+RÈGLE 3 — invoice_number & date
 ═══════════════════════════════════════════════════════════
-
-Cherche la référence commençant par "DE" suivie de 4 à 10 chiffres.
-Elle apparaît en haut à droite du devis, souvent dans un encart "Devis".
-Exemples trouvés dans les documents : DE00001898, DE00004001, DE00005445
-
-Format de sortie OBLIGATOIRE : "devis_de" + numéro en minuscules, sur 8 chiffres minimum.
-  DE00004001 → "devis_de00004001"
-  DE1898     → "devis_de00001898"  (compléter avec des zéros à gauche)
+- invoice_number : Cherche "Devis DE..." en haut à droite. Format OBLIGATOIRE : "devis_de" + 8 chiffres (ex: DE00004894 -> "devis_de00004894").
+- date : Colonne "Date" du tableau (format AAAA-MM-JJ).
 
 ═══════════════════════════════════════════════════════════
-RÈGLE 4 — date
+RÈGLE 4 — LINE ITEMS (prestations facturées)
 ═══════════════════════════════════════════════════════════
+Un item est VALIDE et DOIT être extrait si et seulement si :
+Il possède un P.U. HT ≠ 0 OU un Montant HT ≠ 0 (même si c'est un prix négatif).
+OU Il possède une Qté avec une unité (même si prix = 0).
 
-Colonne "Date" du tableau récapitulatif (date d'émission du devis, pas la date de validité).
-Convertir JJ/MM/AAAA → AAAA-MM-JJ.
-Si absente : "".
+NE PAS CRÉER D'ITEM POUR :
+- Les titres de zones/sections SANS prix ni quantité (ex: "Cellule A1", "CONTRÔLE QUALITÉ DALLAGE"). (Leur nom doit être intégré à la `designation` des items qui les suivent).
+- Les CGV avec Qté=0 et Prix=0 (ex: "Acompte de 30%...", "Travaux réalisés en semaine...").
 
-═══════════════════════════════════════════════════════════
-RÈGLE 5 — LINE ITEMS (prestations facturées)
-═══════════════════════════════════════════════════════════
+── designation (4 à 8 mots max) ──
+- Si la cellule commence par un titre en gras : prendre le titre.
+- Si la ligne est un long tiret textuel sous un titre de zone (ex: sous "CONTRÔLE QUALITÉ", un item commence par "- Prise en charge du dossier..."), la designation doit combiner le titre de zone et le début du tiret : "Contrôle Qualité - Prise en charge dossier".
+- Si le nom d'une zone précède la prestation, l'inclure (ex: "Amené du matériel - Zone 1", "Impact - Cellule A2").
 
-── Qu'est-ce qu'un item valide ? ──────────────────────────
+── description (Texte complet) ──
+Copier FIDÈLEMENT tout le texte explicatif de la cellule, y compris :
+- Le titre de section qui le précédait si pertinent.
+- Les listes à tirets, normes (NF EN...), dimensions (30x30...).
+- Les parenthèses informatives (ex: "(2 unités à 4ml)").
+EXCLURE les conditions générales de vente (horaires, accès eau/élec, acompte, validité).
 
-Un item valide est une ligne du tableau des prestations qui remplit AU MOINS UNE de ces conditions :
-  • P.U. HT est un nombre différent de 0 (positif ou négatif)
-  • Montant HT est un nombre différent de 0 (positif ou négatif)
-  • Qté est renseignée ET l'unité est renseignée (même si prix=0, c'est une prestation réelle)
-
-Ne PAS créer d'item pour :
-  • Lignes entièrement à 0,00 (séparateurs visuels vides)
-  • Sous-totaux ou totaux intermédiaires
-  • Titres de sous-section sans quantité ET sans prix
-    (ex: "Installation et livraison chantier :", "Préparation de surface :", "Contrôles de réception:")
-    Ces lignes font partie de la description de l'item qui les précède.
-
-  RÈGLE ABSOLUE — Le prix prime sur tout le reste :
-    Si une ligne a P.U. HT ≠ 0 OU Montant HT ≠ 0, c'est un item facturable.
-    Même si la ligne commence par un tiret "- ".
-    Même si le texte est court ("- Amené et repli du matériel").
-    Même si ça ressemble à un sous-item.
-    Même si le texte n'est PAS en gras (contrairement aux autres items du même devis).
-    Même si la designation est une phrase longue en texte normal.
-    → Le style typographique (gras/normal/italique) n'est JAMAIS un critère d'exclusion.
-    → Toujours créer un item pour ces lignes.
-  • Conditions générales (voir liste ci-dessous)
-  • La ligne de total général (Total HT, Total TVA, Total TTC)
-
-── designation ─────────────────────────────────────────────
-
-Règle : extraire le NOM COURT de la prestation. 4 à 8 mots maximum.
-
-Si la cellule contient du texte court (une seule ligne) : prendre tel quel.
-  Ex: "Réparation joint épaufré" → "Réparation joint épaufré"
-
-Si la cellule contient du texte long avec une première phrase/ligne en gras :
-  prendre uniquement cette première phrase/ligne en gras comme designation.
-  Ex: cellule commence par "Mise en conformité de la dalle, par application d'un coulis hydraulique"
-      → designation = "Mise en conformité dalle coulis hydraulique"
-
-Si la prestation est une remise/ristourne/escompte :
-  → designation = "Remise exceptionnelle" (ou libellé exact s'il est court)
-
-Conserver les identifiants de zone s'ils sont présents :
-  Ex: "Grenaillage surface - Zone 1", "Ragréage béton - Cellule A3"
-
-RÈGLE SPÉCIALE — designation sans deux-points :
-  Certaines designations n'ont PAS de deux-points à la fin (contrairement à la majorité).
-  Exemples : "Impact", "Fourniture d'une benne...", "Amené et repli du matériel"
-  → Ce sont des items valides exactement comme les autres.
-  → Ne pas les ignorer sous prétexte que la désignation ne finit pas par ":".
-
-RÈGLE SPÉCIALE — designation avec parenthèses informatives :
-  Certaines designations contiennent des précisions entre parenthèses.
-  Ex: "Réparation seuil de porte : (2 unités à 4ml)"
-  → La designation est le texte AVANT la parenthèse : "Réparation seuil de porte"
-  → La quantity vient de la colonne Qté du tableau, PAS du chiffre dans la parenthèse.
-  → Les informations entre parenthèses peuvent figurer dans la description si pertinentes.
-
-── description ─────────────────────────────────────────────
-
-Règle : copier FIDÈLEMENT tout le texte de la cellule Description pour cet item.
-
-Inclure absolument :
-  • Le texte principal (même s'il est long)
-  • Les sous-sections avec titres (ex: "Préparation de surface :", "Contrôles de réception:")
-  • Les listes à tirets et leur contenu
-  • Les surfaces, dimensions, normes (ex: "815 m²", "NF EN 13813", "ARO.5")
-  • Les spécifications techniques
-
-Ne PAS inclure dans description (ces textes sont des CGV, pas des prestations) :
-  • Tout paragraphe sur les horaires de travail (lundi-vendredi, 8h-18h)
-  • Tout paragraphe sur la fourniture d'eau ou d'électricité par le client
-  • Tout paragraphe de non-responsabilité Qualidal sur le béton
-  • Les mentions légales (Siret, RCS, capital)
-  • "Devis gratuit. Les prix TTC sont établis..."
-  • Les pénalités de retard de paiement
-  • Toute condition de paiement / acompte (ex: "Acompte de 30% à la commande",
-    "Solde à réception", "Paiement à 45 jours", "VIREMENT 30 JOURS")
-  • Les délais d'exécution ou de livraison
-  • Les mentions "BON POUR ACCORD", "Cachet + signature"
-
-Pour une remise/ristourne : description = "" (chaîne vide)
-
-── quantity ────────────────────────────────────────────────
-
-Valeur numérique de la colonne Qté.
-Si la colonne est vide ou absente : 0.0
-Toujours un float : 1 → 1.0, 815 → 815.0
-
-ATTENTION : quand une designation contient un nombre entre parenthèses
-(ex: "Réparation seuil de porte : (2 unités à 4ml)"), la quantity est
-TOUJOURS la valeur de la colonne Qté du tableau, pas le chiffre dans la parenthèse.
-
-── unite ───────────────────────────────────────────────────
-
-Normaliser selon ce tableau :
-  FORF / Forfait / FF / Ens / Ensemble      → "FORF"
-  M2 / m² / M²                             → "M2"
-  ML / ml / m / Lin                         → "ML"
-  H / Heure / Heures / HR                  → "Heures"
-  J / Jour / Jours                         → "Jours"
-  Sem / Semaine                             → "Semaine"
-  U / unité / pce / pièce / UNIT / ens      → "U"
-  Vide ou non reconnu                       → "U"
-
-── unit_price ──────────────────────────────────────────────
-
-Valeur de la colonne P.U. HT (prix unitaire hors taxes).
-Peut être négatif (remise). Ex: -130.0
-Si vide : 0.0
-
-── Gestion des zones et sous-sections (CAS FRÉQUENT) ───────
-
-Les devis Qualidal sont souvent structurés par zones géographiques ou bâtiments.
-Exemples de titres de zone rencontrés :
-  "ZONE 1 - Entrepôt principal"       "Bâtiment A"
-  "Cellule A1 / Cellule A2"           "Zone stockage"
-  "Bâtiment B - Extension"            "Nef 1", "Nef 2"
-  "Parking extérieur"                 "Hall d entrée"
-
-RÈGLE — Comment identifier un titre de zone :
-  Pas de valeur dans les colonnes Qté, U, P.U. HT, Montant HT
-  Texte en majuscules ou semi-majuscules, souvent court (1 à 5 mots)
-  Peut avoir une ligne de séparation visuelle (bordure, fond gris)
-  → NE PAS créer d item pour ces lignes
-
-RÈGLE — Les prestations à l intérieur d une zone SONT des items normaux.
-  Intégrer le nom de la zone dans designation pour lever toute ambiguïté :
-  Ex: zone = "ZONE 1" + prestation = "Grenaillage surface"
-      → designation = "Grenaillage surface - Zone 1"
-  Ex: zone = "Cellule A2" + prestation = "Ragréage béton"
-      → designation = "Ragréage béton - Cellule A2"
-
-RÈGLE — Sous-totaux de zone :
-  Certains devis affichent un sous-total par zone ("Sous-total Zone 1 : 12 500,00 EUR").
-  → NE PAS créer d item pour ces lignes de sous-total.
-
-RÈGLE — Colonne R% (remise par ligne) parfois absente :
-  Si la colonne R% n existe pas dans le tableau, ignorer simplement.
-  Ne pas chercher à calculer ou inventer une remise.
-  Les remises globales apparaissent comme une ligne dédiée avec un montant négatif.
+── quantity, unite, unit_price ──
+- quantity : Valeur numérique de la colonne Qté. ATTENTION : Ne JAMAIS prendre un chiffre situé dans la description entre parenthèses (ex: dans "(2 unités à 4ml) 2,00 UNIT", la quantité est 2.00, issue de la colonne Qté).
+- unite : Normaliser (FORF, M2, ML, Heures, Jours, Semaine, U).
+- unit_price : Colonne P.U. HT.
 
 ═══════════════════════════════════════════════════════════
-RÈGLE 6 — totals
+EXEMPLES DE CAS PIÈGES RÉSOLUS
 ═══════════════════════════════════════════════════════════
 
-Lire les valeurs dans le tableau de totaux en bas de dernière page.
-  subtotal_ht : ligne "Total HT"
-  total_tax   : ligne "Total TVA"
-  total_ttc   : ligne "Total TTC" ou "Net à payer"
-Si une valeur est absente : 0.0
+── Cas 1 : Titre collé à la prestation (ex: LTM/WARNING)
+Texte visible : "LTM/WARNING AMENÉ ET REPLI DU MATÉRIEL - Zone 1" avec Qté=1, P.U=685,00.
+-> C'est UN SEUL item valide (puisqu'il y a un prix).
+-> designation: "LTM/WARNING - Amené et repli du matériel - Zone 1"
+-> description: "LTM/WARNING AMENÉ ET REPLI DU MATÉRIEL - Zone 1"
+
+── Cas 2 : Ligne de prestation commençant par un tiret sans titre
+Texte visible : "CONTRÔLE QUALITÉ DALLAGE..." (sans prix)
+Puis ligne suivante : "- Prise en charge du dossier comprenant..." avec Qté=1, P.U=27500,00.
+-> designation: "Contrôle qualité - Prise en charge dossier"
+-> description: "- Prise en charge du dossier comprenant échanges préliminaires, analyse des pièces marché..."
+
+── Cas 3 : Item "Impact" très court, non gras, sans deux-points
+Texte visible : "Impact" avec Qté=2, U=UNIT, P.U=120,00, suivi de "Réparation en mortier..."
+-> C'est bien un item ! designation: "Impact", description: "Réparation en mortier..."
 
 ═══════════════════════════════════════════════════════════
-EXEMPLES RÉELS — FEW-SHOT (basés sur de vrais devis Qualidal)
+FORMAT DE SORTIE (JSON STRICT)
 ═══════════════════════════════════════════════════════════
-
-Ces exemples montrent exactement ce qui est attendu.
-
-── Exemple A — Titre de section/zone sans prix → IGNORÉ ──────
-Sur le devis COGESTRA (DE00005468), la ligne suivante apparaît :
-  "LTM/WARNING   0,00   0,00   0,00   0,00"
-  "ACP            0,00   0,00   0,00   0,00"
-→ Ce sont des titres de zone. Tous les champs = 0. NE PAS créer d item.
-  Même chose pour "Commande : L.25-080" sur le devis LIZSOL.
-
-── Exemple B — Item simple avec designation en MAJUSCULES ────
-Ligne du devis LIZSOL (DE00005573) :
-  "ÉPROUVETTES SUPPLÉMENTAIRES   28,00   UNIT   22,00   616,00"
-  "3 supplémentaires en compression (à 28 jours) x 7 jours
-   1 supplémentaires en fendage (à 28 jours) x 7 jours"
-→ Sortie attendue :
-{
-  "designation": "Éprouvettes supplémentaires",
-  "description": "3 supplémentaires en compression (à 28 jours) x 7 jours. 1 supplémentaires en fendage (à 28 jours) x 7 jours",
-  "quantity": 28.0,
-  "unite": "U",
-  "unit_price": 22.0
-}
-
-── Exemple C — Item avec designation en gras suivi de description ──
-Ligne du devis COGESTRA (DE00005468) :
-  "Réparation épaufrures :   80,00   ML   125,00   10 000,00"
-  "Sciage de part et d autre de l épaufrure sur largeur requise..."
-→ Sortie attendue :
-{
-  "designation": "Réparation épaufrures",
-  "description": "Sciage de part et d autre de l épaufrure sur largeur requise et profondeur de 15 mm, piquage, nettoyage, aspiration, application d un primaire d accrochage et application d un mortier de résine sans retrait. Surfaçage et reconstitution du joint, le cas échéant.",
-  "quantity": 80.0,
-  "unite": "ML",
-  "unit_price": 125.0
-}
-
-── Exemple D — Item avec listes à tirets dans description ────
-Ligne du devis COGESTRA :
-  "Bords des regards :   2,00   UNIT   525,00   1 050,00"
-  "- Sciage périphérique autour du tampon et du regard
-   - Piochage et évacuation des gravats
-   - Recalage du tampon
-   - Scellement du tampon par mortier de résine
-   - Reprise de l ensemble au mortier de résine"
-→ Sortie attendue :
-{
-  "designation": "Bords des regards",
-  "description": "- Sciage périphérique autour du tampon et du regard - Piochage et évacuation des gravats - Recalage du tampon - Scellement du tampon par mortier de résine - Reprise de l ensemble au mortier de résine",
-  "quantity": 2.0,
-  "unite": "U",
-  "unit_price": 525.0
-}
-
-── Exemple E — Description très longue avec sous-sections titrées ──
-Ligne du devis Autostore (DE00004001) :
-  "Mise en conformité de la dalle...   815,00   M2   102,00   83 130,00"
-  Suivi d un très long bloc avec sous-titres en gras : Installation et
-  livraison chantier :, Préparation de surface :, Application coulis
-  hydraulique, Contrôles de réception:
-→ Sortie attendue :
-{
-  "designation": "Mise en conformité dalle coulis hydraulique Autostore",
-  "description": "Mise en conformité de la dalle, par application d un coulis hydraulique conformément aux spécifications AUTOSTORE. 800m². Installation et livraison chantier : - Amené et repli du matériel - Installation de barrières et bâches de protection - Nettoyage de la zone en fin de chantier. Préparation de surface : - Grenaillage de la surface - Application d un primaire d accrochage sablé - Installation de coffrages et traitement des trous, impacts, joints et fissures - Mise en place de boulons réglés à +/- 0.5 mm respectant un maillage de 1.5 x 1.5 m². Application coulis hydraulique : - transport et mise en oeuvre du matériau par camion pompe - Réglage et finition conformément à la norme NF EN 13813, de type P4S avec résistance à l abrasion ARO.5. Contrôles de réception : - Scanner 3D de la surface - Essai de friction / glissance - Essai résistivité électrique",
-  "quantity": 815.0,
-  "unite": "M2",
-  "unit_price": 102.0
-}
-
-── Exemple F — Description avec liste entre parenthèses (pas de confusion items) ──
-Ligne du devis OFFICE DEPOT (DE00001632) :
-  "MISSION DE CAROTTAGE - zone 1 - comprenant : 6 carottes...   1,00   FORF   736,00"
-  Description longue avec (Homogénéité du béton, présence de treillis soudé,
-  diamètre du fil, présence de fibres, type de fibres : Métallique - Synthétiques...)
-→ Les virgules dans les parenthèses NE séparent PAS des items différents.
-→ Sortie attendue :
-{
-  "designation": "Mission de carottage Zone 1",
-  "description": "6 carottes réparties sur l ensemble de la surface. Rédaction d un rapport comprenant la méthodologie, un plan d implantation des carottes, un diagnostic visuel (Homogénéité du béton, présence de treillis soudé, diamètre du fil, présence de fibres, type de fibres : Métallique - Synthétiques, Homogénéité des fibres, présence d air occlus, diamètre des bulles d air, diamètre des agrégats, épaisseur de la couche d usure, type de couche d usure : coulis - saupoudrage), une série de photos. Y compris rebouchage des trous de carottes par mortier hydraulique à retrait compensé.",
-  "quantity": 1.0,
-  "unite": "FORF",
-  "unit_price": 736.0
-}
-
-── Exemple G — Remise (prix négatif, description vide) ───────
-Ligne du devis Autostore :
-  "Remise exceptionnelle   1,00   FORF   -130,00   -130,00"
-→ Sortie attendue :
-{
-  "designation": "Remise exceptionnelle",
-  "description": "",
-  "quantity": 1.0,
-  "unite": "FORF",
-  "unit_price": -130.0
-}
-
-── Exemple H — Suivi avec dates en tirets dans description ───
-Ligne du devis LIZSOL :
-  "SUIVI DE COULAGE - zone 1   7,00   FORF   459,00   3 213,00"
-  Suivi de : "Inclus slump tests, 1 E/C, 3 tests de fibres..."
-  Puis dates : "- 25/02/2026 - 26/02/2026 - 27/02/2026..."
-→ Les dates en tirets font partie de la description, PAS des items séparés.
-→ Sortie attendue :
-{
-  "designation": "Suivi de coulage - Zone 1",
-  "description": "Inclus slump tests, 1 E/C, 3 tests de fibres, confection de 6 éprouvettes essais et envoi des rapports. Détails : 3 éprouvettes à 07 jours en compression, 3 éprouvettes à 14 jours en compression. - 25/02/2026 - 26/02/2026 - 27/02/2026 - 05/03/2026 - 06/03/2026 - 09/03/2026 - 10/03/2026",
-  "quantity": 7.0,
-  "unite": "FORF",
-  "unit_price": 459.0
-}
-
-── Exemple I — Ligne à exclure (CGV / conditions à 0,00) ─────
-Sur le devis COGESTRA page 2 :
-  "Acompte de 30% à la commande   0,00   0,00   0,00   0,00"
-  "Plus-value pour travail le samedi (30%)"
-  "Travaux réalisés en semaine du lundi au vendredi..."
-  "La société QUALIDAL n est pas responsable..."
-→ Tous ces blocs ont Qté=0 et prix=0. Ce sont des CGV. NE PAS créer d items.
-
-── Exemple J — Item en texte normal (non gras) avec prix sur même ligne ──
-Sur ce devis COGESTRA (DE00005468), TOUS les autres items ont leur designation
-en GRAS. Mais cet item est en texte normal :
-  "Fourniture d'une benne pour l'évacuation et le traitement des déchets.   1,00   FORF   900,00   900,00"
-  "Emplacement à convenir le plus proche possible de la zone de travail."
-→ Même si ce n'est PAS en gras, c'est un item valide car il a Qté=1 et P.U. HT=900.
-→ RÈGLE : le style gras/normal n'est pas un critère. Seul le prix compte.
-→ Sortie attendue :
-{
-  "designation": "Fourniture benne évacuation déchets",
-  "description": "Fourniture d'une benne pour l'évacuation et le traitement des déchets. Emplacement à convenir le plus proche possible de la zone de travail.",
-  "quantity": 1.0,
-  "unite": "FORF",
-  "unit_price": 900.0
-}
-
-── Exemple K — Item avec designation SANS deux-points (texte court non gras) ──
-Sur le devis IVANHOE LOGISTIQUE BONDOUFLE (DE00004894), dans la Cellule A2 :
-  "Impact   2,00   UNIT   120,00   240,00"
-  "Réparation en mortier de résine (30x30). Sciage périphérique de l'épaufrure
-   sur largeur et profondeur requise, piquage, nettoyage, aspiration,
-   application d'un primaire d'accrochage et application d'un mortier de résine
-   sans retrait. Surfaçage final si nécessaire."
-→ "Impact" est une designation VALIDE même si :
-   • Elle ne se termine PAS par un deux-points ":"
-   • Elle est courte (un seul mot)
-   • Elle n'est PAS en gras dans ce devis
-→ Critère unique : P.U. HT = 120,00 ≠ 0 → ITEM OBLIGATOIRE.
-→ Sortie attendue :
-{
-  "designation": "Impact - Cellule A2",
-  "description": "Réparation en mortier de résine (30x30). Sciage périphérique de l épaufrure sur largeur et profondeur requise, piquage, nettoyage, aspiration, application d un primaire d accrochage et application d un mortier de résine sans retrait. Surfaçage final si nécessaire.",
-  "quantity": 2.0,
-  "unite": "U",
-  "unit_price": 120.0
-}
-
-── Exemple L — Designation avec parenthèse informative — quantity depuis colonne Qté ──
-Sur le devis IVANHOE LOGISTIQUE BONDOUFLE (DE00004894), dans la Cellule A3,
-la ligne du tableau apparaît EXACTEMENT ainsi (tout sur une seule ligne) :
-  "Réparation seuil de porte : (2 unités à 4ml) 2,00 UNIT 230,00 460,00 20,00"
-
-Décomposition colonne par colonne :
-  [DESCRIPTION                                  ] [Qté ] [U   ] [P.U.  ] [Montant] [TVA]
-  "Réparation seuil de porte : (2 unités à 4ml)"   2,00   UNIT   230,00   460,00   20,00
-
-⚠️  PIÈGE FRÉQUENT : le "2" dans "(2 unités à 4ml)" fait partie du TEXTE de la
-   description, ce n'est PAS la colonne Qté.
-→ La vraie colonne Qté est le "2,00" qui apparaît APRÈS la fermeture de parenthèse ")".
-→ La parenthèse entière "(2 unités à 4ml)" est une précision informative sur la prestation,
-   pas une quantité, pas un item séparé.
-
-→ designation : "Réparation seuil de porte - Cellule A3"
-→ quantity    : 2.0   ← valeur de la colonne Qté, après ")", PAS le chiffre dans la parenthèse
-→ unite       : "U"   ← UNIT normalisé
-→ unit_price  : 230.0
-
-→ Sortie attendue :
-{
-  "designation": "Réparation seuil de porte - Cellule A3",
-  "description": "(2 unités à 4ml). Sciage de part et d autre du seuil sur largeur et profondeur requise, piquage, nettoyage, aspiration, application d un primaire d accrochage et application d un mortier de résine sans retrait. Surfaçage final si nécessaire.",
-  "quantity": 2.0,
-  "unite": "U",
-  "unit_price": 230.0
-}
-
-═══════════════════════════════════════════════════════════
-FORMAT DE SORTIE — JSON STRICT, SANS MARKDOWN
-═══════════════════════════════════════════════════════════
-
 {
   "metadata": {
     "vendor_name": "...",
@@ -725,8 +380,8 @@ FORMAT DE SORTIE — JSON STRICT, SANS MARKDOWN
     "total_tax": 0.0,
     "total_ttc": 0.0
   }
-}"""
-
+}
+"""
 
 # ═══════════════════════════════════════════════════════
 # EXTRACTION VISION  (NOUVEAU v11)

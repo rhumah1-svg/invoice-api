@@ -1,14 +1,24 @@
 """
-Invoice/Quote PDF Extraction API - V13.0
+Invoice/Quote PDF Extraction API - V14.0
 =========================================
-Modifications vs V12 :
-  1. Sélection automatique du modèle selon le nombre de pages :
-       - 1-2 pages  → gpt-4o-mini  (économique, suffisant)
-       - 3+ pages   → gpt-4o       (plus fiable sur devis longs)
-     Override via variable d'environnement OPENAI_MODEL sur Render.
-  2. Log du modèle utilisé pour chaque extraction (diagnostic)
-  3. Tous les autres paramètres V12 conservés :
+Modifications vs V13 :
+  1. Remplacement de get_model(n_pages) par choose_model(pdf_bytes) :
+       - Analyse le CONTENU du PDF (ratio texte/prix, mots-clés AMO, longueur lignes)
+       - Détecte automatiquement les devis complexes (AMO, contrôle qualité, prestations intellectuelles)
+       - Score sur 7 points → gpt-4o si score ≥ 3, sinon gpt-4o-mini
+       - Fallback sur gpt-4o-mini si erreur d'analyse
+       - Override toujours possible via OPENAI_MODEL sur Render
+  2. Log détaillé du score et des raisons de sélection (diagnostic)
+  3. Tous les autres paramètres V13 conservés :
        - max_tokens=8000, dpi=200, detail=high, retry si tronqué
+       - model_used retourné dans la réponse
+
+Logique choose_model :
+  • ratio texte/prix > 1500  → +2 pts  (beaucoup de texte pour peu de lignes tarifées)
+  • longueur moy. ligne > 60 → +1 pt   (lignes descriptives longues)
+  • ≥ 2 mots-clés AMO        → +2 pts  (AMO, DOE, OPR, CCTP, EN15620, etc.)
+  • ≤ 4 prix ET > 2000 chars → +1 pt   (peu d'items mais gros texte)
+  Score ≥ 3 → gpt-4o | Score < 3 → gpt-4o-mini
 """
 
 import os, io, logging, base64, re, gc, json
@@ -25,33 +35,133 @@ from openai import AsyncOpenAI
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
+
 # ═══════════════════════════════════════════════════════
-# SÉLECTION DU MODÈLE  (NOUVEAU V13)
+# SÉLECTION DU MODÈLE  — V14 : analyse contenu PDF
 # ═══════════════════════════════════════════════════════
 
-def get_model(n_pages: int) -> str:
+# Mots-clés caractéristiques des devis AMO / contrôle qualité
+# (prestations intellectuelles avec gros blocs texte descriptif)
+_AMO_KEYWORDS = [
+    "AMO",
+    "phase exe",
+    "phase exé",
+    "OPR",
+    "DOE",
+    "CCTP",
+    "EN15620",
+    "profilographe",
+    "planéité",
+    "réunion préparatoire",
+    "dossier béton",
+    "contrôle qualité",
+    "bureau de contrôle",
+    "pièces marchés",
+    "prédimensionnement",
+    "pré-dimensionnement",
+    "étude préliminaire",
+    "analyse des offres",
+    "rapport journalier",
+    "visite après coulage",
+    "analyse CCTP",
+]
+
+
+def choose_model(pdf_bytes: bytes) -> str:
     """
-    Sélection automatique du modèle OpenAI selon le nombre de pages.
+    Sélection intelligente du modèle OpenAI selon la COMPLEXITÉ du devis.
 
-    Logique :
-      - 1-2 pages → gpt-4o-mini  (~$0.002/devis, suffisant pour devis simples)
-      - 3+ pages  → gpt-4o       (~$0.03/devis, meilleur sur tableaux longs/complexes)
+    Analyse 4 métriques objectives extraites du texte pdfplumber :
+      1. ratio_texte_prix  : caractères totaux / nb lignes avec prix
+      2. avg_line_length   : longueur moyenne des lignes
+      3. keyword_hits      : nb de mots-clés AMO détectés
+      4. lignes_vs_chars   : peu de prix pour beaucoup de texte
 
-    Override complet possible via variable d'environnement Render :
-      OPENAI_MODEL=gpt-4o-mini   → force mini sur tous les devis
-      OPENAI_MODEL=gpt-4o        → force 4o sur tous les devis
-      (absent)                   → logique automatique ci-dessus
-
-    Estimation coût pour 1000 pages (~400 devis) :
-      - Tout mini  : ~$0.66
-      - Auto       : ~$2-3  (selon proportion de devis longs)
-      - Tout 4o    : ~$11
+    Score → gpt-4o si ≥ 3, sinon gpt-4o-mini.
+    Override via env var OPENAI_MODEL (Render).
     """
+    # Override manuel toujours prioritaire
     override = os.getenv("OPENAI_MODEL", "").strip()
     if override in ("gpt-4o", "gpt-4o-mini"):
+        logger.info(f"[choose_model] override env → {override}")
         return override
-    # Logique automatique
-    return "gpt-4o" if n_pages >= 3 else "gpt-4o-mini"
+
+    try:
+        full_text    = ""
+        total_chars  = 0
+        total_lines  = 0
+        lines_with_prices = 0
+
+        with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf:
+            for page in pdf.pages:
+                text = page.extract_text() or ""
+                full_text += text
+                lines = [l.strip() for l in text.split("\n") if l.strip()]
+                total_lines += len(lines)
+
+                for line in lines:
+                    total_chars += len(line)
+                    # Ligne avec prix = contient un nombre type "1 500,00" ou "27 500,00"
+                    if re.search(r'\d[\d\s]{2,},\d{2}', line):
+                        lines_with_prices += 1
+
+        # ── Métriques ──────────────────────────────────────────
+        # Éviter division par zéro
+        ratio_texte_prix = total_chars / max(lines_with_prices, 1)
+        avg_line_length  = total_chars / max(total_lines, 1)
+
+        # Comptage mots-clés AMO (insensible à la casse)
+        full_text_lower = full_text.lower()
+        keyword_hits = sum(
+            1 for kw in _AMO_KEYWORDS
+            if kw.lower() in full_text_lower
+        )
+
+        # ── Score ───────────────────────────────────────────────
+        score   = 0
+        reasons = []
+
+        # Critère 1 : beaucoup de texte pour peu de lignes tarifées
+        # Devis simple : ~400  | Devis AMO : ~3000+
+        if ratio_texte_prix > 1500:
+            score += 2
+            reasons.append(f"ratio_texte_prix={ratio_texte_prix:.0f}>1500 (+2)")
+
+        # Critère 2 : lignes longues = descriptions denses
+        # Devis simple : ~35 chars | Devis AMO : ~70+ chars
+        if avg_line_length > 60:
+            score += 1
+            reasons.append(f"avg_line_length={avg_line_length:.0f}>60 (+1)")
+
+        # Critère 3 : mots-clés AMO (le plus discriminant)
+        # 2+ hits = clairement un devis de prestations intellectuelles
+        if keyword_hits >= 2:
+            score += 2
+            reasons.append(f"keyword_hits={keyword_hits}>=2 (+2)")
+        elif keyword_hits == 1:
+            score += 1
+            reasons.append(f"keyword_hits={keyword_hits}=1 (+1)")
+
+        # Critère 4 : très peu d'items pour un PDF dense
+        # Signale un devis avec de gros blocs texte et peu de lignes de prix
+        if lines_with_prices <= 4 and total_chars > 2000:
+            score += 1
+            reasons.append(f"peu_de_prix={lines_with_prices}<=4 (+1)")
+
+        # ── Décision ────────────────────────────────────────────
+        model = "gpt-4o" if score >= 3 else "gpt-4o-mini"
+
+        logger.info(
+            f"[choose_model] score={score}/7 → {model} | "
+            f"raisons: {' | '.join(reasons) if reasons else 'devis standard'}"
+        )
+
+        return model
+
+    except Exception as e:
+        # En cas d'erreur d'analyse (PDF corrompu, etc.) → fallback safe
+        logger.warning(f"[choose_model] erreur analyse PDF → fallback gpt-4o-mini : {e}")
+        return "gpt-4o-mini"
 
 
 # ═══════════════════════════════════════════════════════
@@ -91,11 +201,11 @@ class InvoiceData(BaseModel):
     totals:     Totals
 
 class ExtractionResponse(BaseModel):
-    success:  bool
-    data:     Optional[InvoiceData] = None
-    error:    Optional[str]         = None
-    file_url: Optional[str]         = None
-    model_used: Optional[str]       = None   # NOUVEAU V13 : modèle utilisé retourné dans la réponse
+    success:    bool
+    data:       Optional[InvoiceData] = None
+    error:      Optional[str]         = None
+    file_url:   Optional[str]         = None
+    model_used: Optional[str]         = None
 
 class SplitResult(BaseModel):
     file_name:  str
@@ -126,7 +236,7 @@ class SplitExtractItem(BaseModel):
     file_name:  str
     pdf_base64: str
     extraction: InvoiceData
-    model_used: Optional[str] = None   # NOUVEAU V13
+    model_used: Optional[str] = None
 
 class SplitExtractError(BaseModel):
     file_name:  str
@@ -136,10 +246,10 @@ class SplitExtractError(BaseModel):
 
 class SplitExtractResponse(BaseModel):
     success:         bool
-    total_found:     int                    = Field(default=0)
-    total_extracted: int                    = Field(default=0)
-    total_errors:    int                    = Field(default=0)
-    results:         list[SplitExtractItem] = Field(default=[])
+    total_found:     int                     = Field(default=0)
+    total_extracted: int                     = Field(default=0)
+    total_errors:    int                     = Field(default=0)
+    results:         list[SplitExtractItem]  = Field(default=[])
     errors:          list[SplitExtractError] = Field(default=[])
 
 
@@ -187,7 +297,7 @@ def pdf_bytes_to_images_b64(pdf_bytes: bytes, dpi: int = 200) -> list[str]:
 
 
 # ═══════════════════════════════════════════════════════
-# DÉCOUPAGE PDF  (inchangé)
+# DÉCOUPAGE PDF
 # ═══════════════════════════════════════════════════════
 
 def split_pdf_into_parts(pdf_bytes: bytes) -> list[dict]:
@@ -235,7 +345,7 @@ def split_pdf_into_parts(pdf_bytes: bytes) -> list[dict]:
 
 
 # ═══════════════════════════════════════════════════════
-# REGEX METADATA  (inchangé)
+# REGEX METADATA
 # ═══════════════════════════════════════════════════════
 
 def extract_metadata_regex(pdf_bytes: bytes, file_name: str) -> dict:
@@ -297,7 +407,7 @@ def extract_metadata_regex(pdf_bytes: bytes, file_name: str) -> dict:
 
 
 # ═══════════════════════════════════════════════════════
-# PROMPT VISION  (inchangé depuis V12)
+# PROMPT VISION  (inchangé depuis V12/V13)
 # ═══════════════════════════════════════════════════════
 
 SYSTEM_PROMPT_VISION = """\
@@ -437,6 +547,16 @@ NOM COURT de la prestation. 4 à 8 mots maximum.
 - Designation sans deux-points (ex: "Impact", "Benne") → valide comme les autres
 - Parenthèse informative → designation = texte AVANT la parenthèse
 
+RÈGLE SPÉCIALE devis AMO / contrôle qualité :
+  Ces devis ont souvent un titre en GRAS ou MAJUSCULES suivi d'un long bloc descriptif.
+  Si le titre de section (ex: "CONTRÔLE QUALITÉ DALLAGE DE 6 600M²") a Qté=0 ET prix=0
+  → NE PAS créer d'item pour ce titre.
+  Les items SUIVANTS avec Qté + prix sont les vrais items à extraire.
+  Exemples de designations courtes attendues :
+    "Etude préliminaire des pièces marchés..." (1,00 FORF 1500€) → "Étude préliminaire phase conception"
+    "En phase Exe:" (1,00 FORF 5240€) → "Mission phase exécution"
+    "1 visite après coulage en phase OPR" (1,00 FORF 821€) → "Visite OPR après coulage"
+
 ── description ────────────────────────────────────
 
 Copier FIDÈLEMENT tout le texte de la cellule pour cet item.
@@ -537,6 +657,22 @@ Sur un devis où tous les autres items sont en GRAS :
 "La société QUALIDAL n est pas responsable..."
 → Qté=0 + prix=0 + CGV → NE PAS créer d'items.
 
+── L — Devis AMO : titre section à 0 + vrais items ─
+"CONTRÔLE QUALITÉ DALLAGE de 6 600m²   —   —   0,00   0,00"
+→ NE PAS créer d'item (prix = 0, c'est un titre de section)
+
+"Etude préliminaire des pièces marchés...   1,00   FORF   1 500,00   1 500,00"
+→ { "designation": "Étude préliminaire phase conception", "description": "Etude préliminaire des pièces marchés et 1ers échanges, analyse CCTP Lot Dallage VS Descriptif technique, analyse des offres techniques lot Dallage, analyse du dossier technique Dallage et prédimensionnement. Participation en visio à une mise au point technique lors de la consultation si nécessaire.", "quantity": 1.0, "unite": "FORF", "unit_price": 1500.0 }
+
+"En phase Exe:   1,00   FORF   5 240,00   5 240,00"
+→ { "designation": "Mission phase exécution", "description": "- Organisation d'une réunion préparatoire avec les lots concernés (géotechnique, dallage, VRD, G.O., Bureau de contrôle) - Analyse et vérification des derniers éléments avant coulage (Notes de calcul, dossier béton, plan EXE finalisé, essais béton, etc.) - Vérification des conditions de coulage après réglage final de la plateforme, lors de la préparation des coulages du lot Dallage - Présence d'une journée lors des coulages en Cellule 1 et en cellules 2 (soit 2 jours) - Rapport journalier - Analyse DOE en phase final avant réception, DOE à nous transmettre.", "quantity": 1.0, "unite": "FORF", "unit_price": 5240.0 }
+
+"1 visite après coulage en phase OPR...   1,00   FORF   821,00   821,00"
+→ { "designation": "Visite OPR après coulage", "description": "1 visite après coulage en phase OPR pour constat et réserves éventuelles.", "quantity": 1.0, "unite": "FORF", "unit_price": 821.0 }
+
+"Plus-values :   —   —   0,00   0,00"
+→ NE PAS créer d'item (prix = 0, texte informatif)
+
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 FORMAT DE SORTIE — JSON STRICT, SANS MARKDOWN
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -567,7 +703,7 @@ FORMAT DE SORTIE — JSON STRICT, SANS MARKDOWN
 
 
 # ═══════════════════════════════════════════════════════
-# EXTRACTION VISION  — V13 avec sélection modèle auto
+# EXTRACTION VISION  — V14 avec choose_model
 # ═══════════════════════════════════════════════════════
 
 async def extract_with_vision(
@@ -576,16 +712,18 @@ async def extract_with_vision(
 ) -> tuple[InvoiceData, str]:
     """
     Retourne (InvoiceData, model_used).
-    V13 : sélection automatique du modèle selon le nombre de pages.
+    V14 : sélection automatique du modèle par analyse du contenu PDF.
     """
     try:
         images_b64 = pdf_bytes_to_images_b64(pdf_bytes, dpi=200)
     except RuntimeError as e:
         raise HTTPException(status_code=500, detail=str(e))
 
-    n_pages   = len(images_b64)
-    model     = get_model(n_pages)
-    logger.info(f"[vision] {n_pages} page(s) → {model}  (règle: {'auto' if not os.getenv('OPENAI_MODEL') else 'override'})")
+    n_pages = len(images_b64)
+
+    # V14 : choose_model analyse le contenu (remplace get_model basé sur nb pages)
+    model = choose_model(pdf_bytes)
+    logger.info(f"[vision] {n_pages} page(s) → modèle sélectionné : {model}")
 
     content = [{
         "type": "text",
@@ -660,7 +798,7 @@ async def extract_with_vision(
 # APP & ROUTES
 # ═══════════════════════════════════════════════════════
 
-app = FastAPI(title="Invoice Extraction API", version="13.0.0")
+app = FastAPI(title="Invoice Extraction API", version="14.0.0")
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
 
 def get_openai_client() -> AsyncOpenAI:
@@ -699,12 +837,13 @@ async def upload_pdf_to_bubble(pdf_bytes: bytes, filename: str) -> str:
 async def health():
     return {
         "status": "ok",
-        "version": "13.0.0",
-        "model_auto": os.getenv("OPENAI_MODEL", "auto (mini ≤2p / 4o ≥3p)"),
+        "version": "14.0.0",
+        "model_selection": "auto (analyse contenu PDF : ratio texte/prix, mots-clés AMO, longueur lignes)",
+        "model_override": os.getenv("OPENAI_MODEL", "non défini — mode auto actif"),
     }
 
 
-# ── /split  (inchangé) ──────────────────────────────────────────────────────
+# ── /split ──────────────────────────────────────────────────────────────────
 @app.post("/split", response_model=SplitResponse)
 async def split_pdf(file: UploadFile = File(...)):
     try:
@@ -721,7 +860,7 @@ async def split_pdf(file: UploadFile = File(...)):
         return SplitResponse(success=False, error=str(e))
 
 
-# ── /extract  (V13 : modèle auto) ───────────────────────────────────────────
+# ── /extract ─────────────────────────────────────────────────────────────────
 @app.post("/extract", response_model=ExtractionResponse)
 async def extract_invoice(file: UploadFile = File(...)):
     try:
@@ -738,7 +877,7 @@ async def extract_invoice(file: UploadFile = File(...)):
         return ExtractionResponse(success=False, error=str(e))
 
 
-# ── /split-light  (inchangé) ────────────────────────────────────────────────
+# ── /split-light ─────────────────────────────────────────────────────────────
 @app.post("/split-light", response_model=SplitLightResponse)
 async def split_light(file: UploadFile = File(...)):
     try:
@@ -772,7 +911,7 @@ async def split_light(file: UploadFile = File(...)):
         return SplitLightResponse(success=False, error=str(e))
 
 
-# ── /split-and-extract  (V13 : modèle auto par devis) ──────────────────────
+# ── /split-and-extract ───────────────────────────────────────────────────────
 @app.post("/split-and-extract", response_model=SplitExtractResponse)
 async def split_and_extract(file: UploadFile = File(...)):
     try:
@@ -785,6 +924,7 @@ async def split_and_extract(file: UploadFile = File(...)):
 
         for part in parts:
             try:
+                # choose_model appelé individuellement pour chaque devis splitté
                 data, model_used = await extract_with_vision(part["pdf_bytes"], openai_client)
                 b64  = base64.b64encode(part["pdf_bytes"]).decode()
                 results.append(SplitExtractItem(

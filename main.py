@@ -13,7 +13,8 @@ Modifications vs V13 :
        - max_tokens=8000, dpi=200, detail=high, retry si tronqué
        - model_used retourné dans la réponse
 
-Logique choose_model :
+Logique choose_model (score sur 8 points) :
+  • nb pages ≥ 3             → +2 pts  (devis long, risque items manqués en fin de tableau)
   • ratio texte/prix > 1500  → +2 pts  (beaucoup de texte pour peu de lignes tarifées)
   • longueur moy. ligne > 60 → +1 pt   (lignes descriptives longues)
   • ≥ 2 mots-clés AMO        → +2 pts  (AMO, DOE, OPR, CCTP, EN15620, etc.)
@@ -93,6 +94,7 @@ def choose_model(pdf_bytes: bytes) -> str:
         lines_with_prices = 0
 
         with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf:
+            n_pages = len(pdf.pages)
             for page in pdf.pages:
                 text = page.extract_text() or ""
                 full_text += text
@@ -121,19 +123,25 @@ def choose_model(pdf_bytes: bytes) -> str:
         score   = 0
         reasons = []
 
-        # Critère 1 : beaucoup de texte pour peu de lignes tarifées
+        # Critère 1 : 3 pages ou plus → risque d'items manqués, 4o plus fiable
+        # Reprend la règle de V13 (get_model basé sur nb pages)
+        if n_pages >= 3:
+            score += 2
+            reasons.append(f"nb_pages={n_pages}>=3 (+2)")
+
+        # Critère 2 : beaucoup de texte pour peu de lignes tarifées
         # Devis simple : ~400  | Devis AMO : ~3000+
         if ratio_texte_prix > 1500:
             score += 2
             reasons.append(f"ratio_texte_prix={ratio_texte_prix:.0f}>1500 (+2)")
 
-        # Critère 2 : lignes longues = descriptions denses
+        # Critère 3 : lignes longues = descriptions denses
         # Devis simple : ~35 chars | Devis AMO : ~70+ chars
         if avg_line_length > 60:
             score += 1
             reasons.append(f"avg_line_length={avg_line_length:.0f}>60 (+1)")
 
-        # Critère 3 : mots-clés AMO (le plus discriminant)
+        # Critère 4 : mots-clés AMO (le plus discriminant)
         # 2+ hits = clairement un devis de prestations intellectuelles
         if keyword_hits >= 2:
             score += 2
@@ -142,14 +150,16 @@ def choose_model(pdf_bytes: bytes) -> str:
             score += 1
             reasons.append(f"keyword_hits={keyword_hits}=1 (+1)")
 
-        # Critère 4 : très peu d'items pour un PDF dense
+        # Critère 5 : très peu d'items pour un PDF dense
         # Signale un devis avec de gros blocs texte et peu de lignes de prix
         if lines_with_prices <= 4 and total_chars > 2000:
             score += 1
             reasons.append(f"peu_de_prix={lines_with_prices}<=4 (+1)")
 
         # ── Décision ────────────────────────────────────────────
-        model = "gpt-4o" if score >= 3 else "gpt-4o-mini"
+        # Seuil 2 : nb_pages>=3 seul (score=2) suffit à déclencher 4o
+        # car les devis longs ont plus de risques d'items manqués en fin de tableau
+        model = "gpt-4o" if score >= 2 else "gpt-4o-mini"
 
         logger.info(
             f"[choose_model] score={score}/7 → {model} | "

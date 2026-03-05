@@ -1,25 +1,16 @@
 """
-Invoice/Quote PDF Extraction API - V14.0
+Invoice/Quote PDF Extraction API - V15.0
 =========================================
-Modifications vs V13 :
-  1. Remplacement de get_model(n_pages) par choose_model(pdf_bytes) :
-       - Analyse le CONTENU du PDF (ratio texte/prix, mots-clés AMO, longueur lignes)
-       - Détecte automatiquement les devis complexes (AMO, contrôle qualité, prestations intellectuelles)
-       - Score sur 7 points → gpt-4o si score ≥ 3, sinon gpt-4o-mini
-       - Fallback sur gpt-4o-mini si erreur d'analyse
-       - Override toujours possible via OPENAI_MODEL sur Render
-  2. Log détaillé du score et des raisons de sélection (diagnostic)
-  3. Tous les autres paramètres V13 conservés :
-       - max_tokens=8000, dpi=200, detail=high, retry si tronqué
-       - model_used retourné dans la réponse
-
-Logique choose_model (score sur 8 points) :
-  • nb pages ≥ 3             → +2 pts  (devis long, risque items manqués en fin de tableau)
-  • ratio texte/prix > 1500  → +2 pts  (beaucoup de texte pour peu de lignes tarifées)
-  • longueur moy. ligne > 60 → +1 pt   (lignes descriptives longues)
-  • ≥ 2 mots-clés AMO        → +2 pts  (AMO, DOE, OPR, CCTP, EN15620, etc.)
-  • ≤ 4 prix ET > 2000 chars → +1 pt   (peu d'items mais gros texte)
-  Score ≥ 3 → gpt-4o | Score < 3 → gpt-4o-mini
+Modifications vs V14 :
+  1. choose_model V15 : nouveau critère "densité descriptive" (avg_desc_density)
+     - Détecte les devis avec descriptions longues entre les lignes de prix
+     - Score sur 10 points, seuil >= 2 pour gpt-4o
+  2. Prompt V15 : 4 nouvelles règles
+     - Règle N°3 : frontière stricte entre items (méthode 3 passes)
+     - Règle N°4 : formats numériques français (espaces milliers)
+     - Règle Cellules : "Cellule X - NOM" dans designation
+     - Règle description vide : Amené et repli, Trie des déchets, etc.
+  3. 5 nouveaux exemples few-shot (M, N, O, P, Q)
 """
 
 import os, io, logging, base64, re, gc, json
@@ -38,81 +29,35 @@ logger = logging.getLogger(__name__)
 
 
 # ═══════════════════════════════════════════════════════
-# SÉLECTION DU MODÈLE  — V14 : analyse contenu PDF
+# SÉLECTION DU MODÈLE  — V15 : + densité descriptive
 # ═══════════════════════════════════════════════════════
 
-# Mots-clés caractéristiques des devis AMO / contrôle qualité
-# (prestations intellectuelles avec gros blocs texte descriptif)
 _AMO_KEYWORDS = [
-    "AMO",
-    "phase exe",
-    "phase exé",
-    "OPR",
-    "DOE",
-    "CCTP",
-    "EN15620",
-    "profilographe",
-    "planéité",
-    "réunion préparatoire",
-    "dossier béton",
-    "contrôle qualité",
-    "bureau de contrôle",
-    "pièces marchés",
-    "prédimensionnement",
-    "pré-dimensionnement",
-    "étude préliminaire",
-    "analyse des offres",
-    "rapport journalier",
-    "visite après coulage",
+    "AMO", "phase exe", "phase exé", "OPR", "DOE", "CCTP", "EN15620",
+    "profilographe", "planéité", "réunion préparatoire", "dossier béton",
+    "contrôle qualité", "bureau de contrôle", "pièces marchés",
+    "prédimensionnement", "pré-dimensionnement", "étude préliminaire",
+    "analyse des offres", "rapport journalier", "visite après coulage",
     "analyse CCTP",
 ]
 
 
-# ═══════════════════════════════════════════════════════
-# PATCH choose_model() — V15
-# ═══════════════════════════════════════════════════════
-#
-# CHANGEMENTS vs V14 :
-#   1. Nouveau critère 6 : "densité descriptive" — détecte les devis avec
-#      des blocs de texte longs entre les lignes de prix (comme le devis
-#      XPO Aéroparc "Système Semi Lisse"). Ces devis sont difficiles pour
-#      gpt-4o-mini car les frontières entre items ne sont pas visuellement
-#      claires.
-#   2. Score max passe de 8 à 10 points, seuil reste à ≥ 2
-#   3. Log amélioré avec toutes les métriques
-#
-# Pour appliquer : remplacer la fonction choose_model() dans main.py
-# ═══════════════════════════════════════════════════════
-
 def choose_model(pdf_bytes: bytes) -> str:
     """
-    Sélection intelligente du modèle OpenAI selon la COMPLEXITÉ du devis.
-
-    Analyse 6 métriques objectives extraites du texte pdfplumber :
-      1. nb_pages          : nombre de pages
-      2. ratio_texte_prix  : caractères totaux / nb lignes avec prix
-      3. avg_line_length   : longueur moyenne des lignes
-      4. keyword_hits      : nb de mots-clés AMO détectés
-      5. lignes_vs_chars   : peu de prix pour beaucoup de texte
-      6. desc_density      : nb moyen de lignes de texte entre deux lignes de prix
-                             (détecte les devis avec descriptions denses)
-
-    Score sur 10 → gpt-4o si score ≥ 2, sinon gpt-4o-mini.
-    Override via env var OPENAI_MODEL.
+    V15 : sélection intelligente avec 6 critères (score sur 10).
+    Nouveau critère : densité descriptive (lignes de texte entre lignes de prix).
     """
-    # Override manuel toujours prioritaire
     override = os.getenv("OPENAI_MODEL", "").strip()
     if override in ("gpt-4o", "gpt-4o-mini"):
         logger.info(f"[choose_model] override env → {override}")
         return override
 
     try:
-        full_text    = ""
-        total_chars  = 0
-        total_lines  = 0
+        full_text = ""
+        total_chars = 0
+        total_lines = 0
         lines_with_prices = 0
-        # V15 : comptage des lignes de texte entre les lignes de prix
-        text_lines_between_prices = []  # liste des gaps entre lignes prix
+        text_lines_between_prices = []
         current_gap = 0
 
         with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf:
@@ -125,72 +70,46 @@ def choose_model(pdf_bytes: bytes) -> str:
 
                 for line in lines:
                     total_chars += len(line)
-                    # Ligne avec prix = contient un nombre type "1 500,00" ou "27 500,00"
                     if re.search(r'\d[\d\s]{2,},\d{2}', line):
                         lines_with_prices += 1
-                        # V15 : enregistrer le gap depuis la dernière ligne prix
                         if current_gap > 0:
                             text_lines_between_prices.append(current_gap)
                         current_gap = 0
                     else:
                         current_gap += 1
 
-        # ── Métriques ──────────────────────────────────────────
         ratio_texte_prix = total_chars / max(lines_with_prices, 1)
-        avg_line_length  = total_chars / max(total_lines, 1)
-
-        # V15 : densité descriptive = nombre moyen de lignes de texte entre les lignes de prix
-        # Devis simple : ~0-1 (juste titre + chiffres)
-        # Devis dense  : ~3-6 (titre + description multi-lignes + chiffres)
+        avg_line_length = total_chars / max(total_lines, 1)
         avg_desc_density = (
             sum(text_lines_between_prices) / len(text_lines_between_prices)
             if text_lines_between_prices else 0
         )
         max_desc_gap = max(text_lines_between_prices) if text_lines_between_prices else 0
 
-        # Comptage mots-clés AMO
         full_text_lower = full_text.lower()
-        keyword_hits = sum(
-            1 for kw in _AMO_KEYWORDS
-            if kw.lower() in full_text_lower
-        )
+        keyword_hits = sum(1 for kw in _AMO_KEYWORDS if kw.lower() in full_text_lower)
 
-        # ── Score ───────────────────────────────────────────────
-        score   = 0
+        score = 0
         reasons = []
 
-        # Critère 1 : 3 pages ou plus → risque d'items manqués
         if n_pages >= 3:
             score += 2
             reasons.append(f"nb_pages={n_pages}>=3 (+2)")
-
-        # Critère 2 : beaucoup de texte pour peu de lignes tarifées
         if ratio_texte_prix > 1500:
             score += 2
             reasons.append(f"ratio_texte_prix={ratio_texte_prix:.0f}>1500 (+2)")
-
-        # Critère 3 : lignes longues = descriptions denses
         if avg_line_length > 60:
             score += 1
             reasons.append(f"avg_line_length={avg_line_length:.0f}>60 (+1)")
-
-        # Critère 4 : mots-clés AMO
         if keyword_hits >= 2:
             score += 2
             reasons.append(f"keyword_hits={keyword_hits}>=2 (+2)")
         elif keyword_hits == 1:
             score += 1
             reasons.append(f"keyword_hits={keyword_hits}=1 (+1)")
-
-        # Critère 5 : très peu d'items pour un PDF dense
         if lines_with_prices <= 4 and total_chars > 2000:
             score += 1
             reasons.append(f"peu_de_prix={lines_with_prices}<=4 (+1)")
-
-        # Critère 6 (V15) : densité descriptive élevée
-        # Si en moyenne il y a 3+ lignes de texte entre chaque ligne de prix,
-        # OU si un bloc dépasse 5 lignes, c'est un devis avec descriptions denses
-        # que gpt-4o-mini risque de mal découper.
         if avg_desc_density >= 3:
             score += 2
             reasons.append(f"avg_desc_density={avg_desc_density:.1f}>=3 (+2)")
@@ -198,7 +117,6 @@ def choose_model(pdf_bytes: bytes) -> str:
             score += 1
             reasons.append(f"max_desc_gap={max_desc_gap}>=5 (+1)")
 
-        # ── Décision ────────────────────────────────────────────
         model = "gpt-4o" if score >= 2 else "gpt-4o-mini"
 
         logger.info(
@@ -207,7 +125,6 @@ def choose_model(pdf_bytes: bytes) -> str:
             f"avg_desc_density={avg_desc_density:.1f} max_gap={max_desc_gap} | "
             f"raisons: {' | '.join(reasons) if reasons else 'devis standard'}"
         )
-
         return model
 
     except Exception as e:
@@ -228,7 +145,7 @@ class Metadata(BaseModel):
 
 class LineItem(BaseModel):
     designation: str   = Field(..., description="Nom court du produit/service (5-8 mots max)")
-    description:  str  = Field(
+    description: str   = Field(
         default="",
         description=(
             "Texte COMPLET de la cellule Description pour cet item. "
@@ -237,9 +154,9 @@ class LineItem(BaseModel):
             "'Fourniture eau/électricité...', 'QUALIDAL n est pas responsable...'"
         )
     )
-    quantity:     float = Field(..., description="Quantité")
-    unite:        str   = Field(..., description="Unité (ML, M2, FORF, U, etc.)")
-    unit_price:   float = Field(..., description="Prix unitaire HT")
+    quantity:    float = Field(..., description="Quantité")
+    unite:       str   = Field(..., description="Unité (ML, M2, FORF, U, etc.)")
+    unit_price:  float = Field(..., description="Prix unitaire HT")
 
 class Totals(BaseModel):
     subtotal_ht: float = Field(..., description="Total HT")
@@ -308,11 +225,8 @@ class SplitExtractResponse(BaseModel):
 # PDF → IMAGES BASE64
 # ═══════════════════════════════════════════════════════
 
-def pdf_bytes_to_images_b64(pdf_bytes: bytes, dpi: int = 150) -> list[str]:
-    """
-    Chaque page du PDF → JPEG base64.
-    DPI 200 pour meilleure lisibilité des tableaux serrés.
-    """
+def pdf_bytes_to_images_b64(pdf_bytes: bytes, dpi: int = 200) -> list[str]:
+    """Chaque page du PDF → JPEG base64. DPI 200 pour meilleure lisibilité."""
     try:
         import fitz  # pymupdf
         doc = fitz.open(stream=pdf_bytes, filetype="pdf")
@@ -353,12 +267,12 @@ def pdf_bytes_to_images_b64(pdf_bytes: bytes, dpi: int = 150) -> list[str]:
 
 def split_pdf_into_parts(pdf_bytes: bytes) -> list[dict]:
     split_points, devis_names = [], []
-    reader_scan  = PdfReader(io.BytesIO(pdf_bytes))
-    total_pages  = len(reader_scan.pages)
+    reader_scan = PdfReader(io.BytesIO(pdf_bytes))
+    total_pages = len(reader_scan.pages)
 
     for i in range(total_pages):
         try:
-            txt   = reader_scan.pages[i].extract_text() or ""
+            txt = reader_scan.pages[i].extract_text() or ""
             match = re.search(r"DE\d{4,10}", txt, re.IGNORECASE)
             if match:
                 split_points.append(i)
@@ -458,18 +372,7 @@ def extract_metadata_regex(pdf_bytes: bytes, file_name: str) -> dict:
 
 
 # ═══════════════════════════════════════════════════════
-# PROMPT VISION  (inchangé depuis V12/V13)
-# ═══════════════════════════════════════════════════════
-
-# ═══════════════════════════════════════════════════════
-# ═══════════════════════════════════════════════════════
-# ═══════════════════════════════════════════════════════
-# PROMPT VISION V15 — Corrections :
-#   1. Règle "Amené et repli" : description vide si pas de texte descriptif
-#   2. Règle "Cellule X - NOM" : inclure dans designation
-#   3. Règle formats numériques : 1 000 = 1000, virgule décimale
-#   4. Règle anti-mélange descriptions : frontière stricte entre items
-#   5. Nouveaux exemples few-shot couvrant ces cas
+# PROMPT VISION  — V15
 # ═══════════════════════════════════════════════════════
 
 SYSTEM_PROMPT_VISION = """\
@@ -967,7 +870,7 @@ FORMAT DE SORTIE — JSON STRICT, SANS MARKDOWN
 
 
 # ═══════════════════════════════════════════════════════
-# EXTRACTION VISION  — V14 avec choose_model
+# EXTRACTION VISION  — V15 avec choose_model
 # ═══════════════════════════════════════════════════════
 
 async def extract_with_vision(
@@ -976,35 +879,30 @@ async def extract_with_vision(
 ) -> tuple[InvoiceData, str]:
     """
     Retourne (InvoiceData, model_used).
-    V14 : sélection automatique du modèle par analyse du contenu PDF.
+    V15 : sélection automatique du modèle par analyse du contenu PDF.
     """
     try:
-        images_b64 = pdf_bytes_to_images_b64(pdf_bytes, dpi=150)
+        images_b64 = pdf_bytes_to_images_b64(pdf_bytes, dpi=200)
     except RuntimeError as e:
         raise HTTPException(status_code=500, detail=str(e))
 
     n_pages = len(images_b64)
 
-    # V14 : choose_model analyse le contenu (remplace get_model basé sur nb pages)
     model = choose_model(pdf_bytes)
-with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf:
-    raw_text = "\n".join(p.extract_text() or "" for p in pdf.pages)
+    logger.info(f"[vision] {n_pages} page(s) → modèle sélectionné : {model}")
 
-logger.info(f"[vision] {n_pages} page(s) → modèle sélectionné : {model}")
-
-content = [{
-    "type": "text",
-    "text": (
-        f"Voici les {n_pages} page(s) d'un devis Qualidal. "
-        "IMPORTANT : parcours TOUTES les pages et extrait TOUS les items avec P.U. HT ≠ 0. "
-        "Retourne UNIQUEMENT le JSON complet.\n\n"
-        f"Texte brut extrait du PDF :\n{raw_text[:4000]}"
-    )
-}]
+    content = [{
+        "type": "text",
+        "text": (
+            f"Voici les {n_pages} page(s) d'un devis Qualidal. "
+            "IMPORTANT : parcours TOUTES les pages et extrait TOUS les items avec P.U. HT ≠ 0. "
+            "Retourne UNIQUEMENT le JSON complet."
+        )
+    }]
     for img_b64 in images_b64:
         content.append({
             "type": "image_url",
-            "image_url": {"url": f"data:image/jpeg;base64,{img_b64}", "detail": "auto"}
+            "image_url": {"url": f"data:image/jpeg;base64,{img_b64}", "detail": "high"}
         })
 
     last_error = None
@@ -1066,7 +964,7 @@ content = [{
 # APP & ROUTES
 # ═══════════════════════════════════════════════════════
 
-app = FastAPI(title="Invoice Extraction API", version="14.0.0")
+app = FastAPI(title="Invoice Extraction API", version="15.0.0")
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
 
 def get_openai_client() -> AsyncOpenAI:
@@ -1105,8 +1003,8 @@ async def upload_pdf_to_bubble(pdf_bytes: bytes, filename: str) -> str:
 async def health():
     return {
         "status": "ok",
-        "version": "14.0.0",
-        "model_selection": "auto (analyse contenu PDF : ratio texte/prix, mots-clés AMO, longueur lignes)",
+        "version": "15.0.0",
+        "model_selection": "auto V15 (ratio texte/prix, mots-clés AMO, densité descriptive)",
         "model_override": os.getenv("OPENAI_MODEL", "non défini — mode auto actif"),
     }
 
@@ -1192,7 +1090,6 @@ async def split_and_extract(file: UploadFile = File(...)):
 
         for part in parts:
             try:
-                # choose_model appelé individuellement pour chaque devis splitté
                 data, model_used = await extract_with_vision(part["pdf_bytes"], openai_client)
                 b64  = base64.b64encode(part["pdf_bytes"]).decode()
                 results.append(SplitExtractItem(

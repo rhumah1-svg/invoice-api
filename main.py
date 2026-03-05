@@ -421,6 +421,7 @@ def extract_metadata_regex(pdf_bytes: bytes, file_name: str) -> dict:
 # ═══════════════════════════════════════════════════════
 
 # ═══════════════════════════════════════════════════════
+# ═══════════════════════════════════════════════════════
 # PROMPT VISION V15 — Corrections :
 #   1. Règle "Amené et repli" : description vide si pas de texte descriptif
 #   2. Règle "Cellule X - NOM" : inclure dans designation
@@ -470,22 +471,55 @@ Ne jamais fusionner le contenu de deux cellules différentes.
 ⛔ RÈGLE ABSOLUE N°3 — FRONTIÈRE STRICTE ENTRE ITEMS
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-Chaque item du tableau occupe UNE CELLULE dans la colonne Description.
-La FRONTIÈRE entre deux items est déterminée par la GRILLE DU TABLEAU :
-  → Là où une NOUVELLE LIGNE a ses propres valeurs Qté / U / P.U. HT / Montant HT,
-    c'est un NOUVEL ITEM. Tout le texte AU-DESSUS (dans la même cellule) appartient
-    à l'item PRÉCÉDENT. Tout le texte EN-DESSOUS appartient au NOUVEL item.
+Le tableau des prestations a des colonnes : Description | Qté | U | P.U. HT | Montant HT | TVA
+Chaque item = UNE RANGÉE (ou groupe de rangées) avec des CHIFFRES dans les colonnes Qté/P.U. HT.
 
-MÉTHODE DE LECTURE — procéder item par item :
-  1. Repère la ligne avec le TITRE EN GRAS (ou le texte court) + les colonnes Qté/U/P.U. HT
-  2. Le texte en dessous DANS LA MÊME CELLULE = la description de CET item
-  3. DÈS qu'une nouvelle ligne a ses propres colonnes Qté/U/P.U. HT → STOP, c'est l'item suivant
-  4. Si entre le titre et les colonnes chiffrées il n'y a AUCUN texte descriptif → description = ""
+⚠️ LA CLÉ : regarde les colonnes CHIFFRÉES (Qté, P.U. HT, Montant HT) pour délimiter les items.
+  → Chaque fois que tu vois des chiffres ALIGNÉS dans les colonnes Qté + U + P.U. HT,
+    c'est une NOUVELLE PRESTATION = un nouvel item.
+  → Le texte dans la colonne Description qui est sur LA MÊME RANGÉE que ces chiffres
+    (ou juste en dessous avant les prochains chiffres) = l'item avec sa description.
+
+MÉTHODE DE LECTURE EN 3 PASSES :
+
+PASSE 1 — INVENTAIRE : Parcours tout le tableau de haut en bas.
+  À chaque fois que tu vois des chiffres dans les colonnes Qté + P.U. HT, note :
+    "Item N : [texte de la ligne] — Qté=X, U=Y, P.U.HT=Z, Montant=W"
+  C'est ta LISTE DE RÉFÉRENCE. Compte-les = nombre d'items attendus.
+
+PASSE 2 — DESCRIPTION : Pour chaque item de ta liste :
+  - Le TITRE = la ligne (souvent en gras) qui est sur la même rangée que les chiffres
+  - La DESCRIPTION = le texte qui suit EN DESSOUS, JUSQU'À la rangée de l'item suivant
+  - Si le prochain item (chiffres suivants) commence IMMÉDIATEMENT après le titre
+    sans texte intermédiaire → description = "" (chaîne vide)
+
+PASSE 3 — VÉRIFICATION : Ton nombre d'items JSON doit correspondre au comptage de la passe 1.
+
+EXEMPLE VISUEL — Comment lire ce tableau :
+  ┌─────────────────────────────────────┬───────┬──────┬─────────┬──────────┐
+  │ AMENÉ ET REPLI DU MATÉRIEL - Zone 1 │  1,00 │ FORF │ 1 150,00│ 1 150,00 │ ← ITEM 1 (chiffres)
+  │                                     │       │      │         │          │
+  │ Préparation du support :            │  1,00 │ FORF │ 2 580,00│ 2 580,00 │ ← ITEM 2 (chiffres)
+  │ Ponçage diamant de la surface...    │       │      │         │          │   (description item 2)
+  │ Ponçage diamant manuel des bords... │       │      │         │          │   (suite description)
+  └─────────────────────────────────────┴───────┴──────┴─────────┴──────────┘
+
+  → Item 1 : "Amené et repli du matériel - Zone 1", description = "" car AUCUN texte
+    entre cette ligne et la suivante qui a des chiffres (Préparation du support).
+  → Item 2 : "Préparation du support", description = "Ponçage diamant de la surface..."
+    car ce texte est SOUS la rangée de l'item 2 et AVANT l'item 3.
+
+  ⚠️ ERREUR TYPIQUE À ÉVITER : attribuer "Ponçage diamant..." à "Amené et repli"
+     simplement parce que le texte apparaît visuellement en dessous. NON !
+     Il faut regarder les CHIFFRES : "Ponçage diamant" est dans la cellule
+     de "Préparation du support" (même rangée de chiffres), pas celle d'Amené et repli.
 
 INTERDIT :
   • Prendre le texte descriptif d'un item voisin pour remplir un item qui n'en a pas
   • Fusionner deux cellules de description adjacentes
   • Inventer une description quand la cellule n'en contient pas
+  • Attribuer du texte à un item en se basant sur la proximité visuelle verticale
+    SANS vérifier l'alignement avec les colonnes chiffrées
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 ⛔ RÈGLE ABSOLUE N°4 — NOMBRES ET FORMATS
@@ -633,22 +667,40 @@ RÈGLE SPÉCIALE devis AMO / contrôle qualité :
 
 ── description ────────────────────────────────────
 
-La description est le texte qui se trouve DANS LA MÊME CELLULE du tableau,
-SOUS le titre/designation de l'item.
+La description est le texte qui se trouve DANS LA MÊME RANGÉE du tableau
+que les chiffres de l'item, ou dans les lignes ENTRE cet item et le SUIVANT.
+
+MÉTHODE POUR DÉTERMINER LA DESCRIPTION D'UN ITEM :
+  1. Identifie la rangée de l'item (celle avec Qté + U + P.U. HT)
+  2. Regarde si le titre occupe toute la ligne ou s'il y a du texte descriptif
+     sur cette même rangée (après le titre, avant les chiffres)
+  3. Regarde les lignes EN DESSOUS : tout le texte JUSQU'À la prochaine rangée
+     qui a des chiffres dans Qté/P.U. HT = description de CET item
+  4. S'il n'y a AUCUN texte entre cette rangée et la prochaine rangée chiffrée
+     → description = "" (chaîne vide)
+
+PIÈGE PRINCIPAL — Items courts sans description :
+  Certaines lignes n'ont QUE le titre + les chiffres, sans aucun texte descriptif.
+  Le texte qui apparaît visuellement "en dessous" appartient en fait à l'ITEM SUIVANT.
+  
+  Exemples de lignes qui ont TOUJOURS ou presque une description VIDE :
+    • "AMENÉ ET REPLI DU MATÉRIEL" → description = ""
+    • "Trie des déchets" → description = ""
+    • "TRAVAIL VENDREDI - SAMEDI - DIMANCHE" → description = ""
+    • "Remise exceptionnelle" → description = ""
+  
+  Pour vérifier : est-ce que le texte en dessous commence par un NOUVEAU TITRE
+  qui a ses propres chiffres Qté/P.U. HT ? Si oui → ce texte ne lui appartient pas.
 
 RÈGLES STRICTES :
-  1. Si la cellule contient UNIQUEMENT le titre (ex: "AMENÉ ET REPLI DU MATÉRIEL - Zone 2")
-     SANS texte descriptif en dessous → description = "" (chaîne vide)
+  1. Si la cellule contient UNIQUEMENT le titre SANS texte descriptif → description = ""
   2. Ne JAMAIS emprunter le texte d'une cellule voisine pour remplir une description vide
-  3. La description se termine là où commence la CELLULE SUIVANTE du tableau
+  3. La description se termine là où commence la RANGÉE SUIVANTE avec des chiffres
   4. Inclure : texte principal, sous-sections, tirets, normes, dimensions
   5. Exclure (CGV) : horaires de travail, fourniture eau/électricité, non-responsabilité
      Qualidal, mentions légales, conditions de paiement, délais, "BON POUR ACCORD"
   6. Pour une remise : description = "" (chaîne vide)
-
-CAS FRÉQUENT "Amené et repli du matériel" :
-  Cette ligne a presque toujours une description VIDE. Elle apparaît en début de devis
-  avec juste le titre + Qté 1 + FORF + prix. Ne lui attribuer AUCUNE description.
+  7. Copier la description ENTIÈRE et FIDÈLEMENT — ne pas tronquer à mi-phrase
 
 ── quantity ───────────────────────────────────────
 
@@ -810,6 +862,38 @@ et application d'un mortier de résine sans retrait. Surfaçage final si nécess
 ⚠️ La description de "Réparation divers Mortier (10x10)" est DIFFÉRENTE de
    celle de "Réparation divers Mortier (20x20)" même si elles se ressemblent.
    Chaque item a SA PROPRE cellule de description.
+
+── Q — DEVIS COMPLET avec items SANS et AVEC description ──
+Voici un devis type "Système Semi Lisse" avec 6 items. Attention aux frontières :
+
+"AMENÉ ET REPLI DU MATÉRIEL - Zone 1   1,00   FORF   1 150,00   1 150,00"
+"Préparation du support :               1,00   FORF   2 580,00   2 580,00"
+"Ponçage diamant de la surface avec aspiration des poussières à la source."
+"Ponçage diamant manuel des bords et des zones inaccessibles avec respiration à la source"
+"Application du système :               1,00   FORF   9 480,00   9 480,00"
+"Fourniture et application d'une couche d'égalisation à raison de 2,5kg/m² saupoudrée à refus de silice."
+"Fourniture et application d'une couche de fond à raison de 2,5kg/m² saupoudrée à refus."
+"Fourniture et application d'une couche de garnissage époxy à raison de 650gr/m²."
+"Fourniture et application de relevés avec une gorge en mastic époxy dans l'angle sol/mur."
+"Ponçage et aspiration de la zone entre chaque étape de l'intervention."
+"Gorge + remonté de mur sur 1m:        46,00   ML     66,00     3 036,00"
+"Mise en oeuvre de gorge périphérique au mortier de résine époxy"
+"Remonté de mur en résine époxy teinte RAL 7040"
+"Trie des déchets                        1,00   FORF   450,00      450,00"
+"TRAVAIL VENDREDI - SAMEDI - DIMANCHE    1,00   FORF   2 220,00   2 220,00"
+"Zone accessible à partir du lundi."
+
+Résultat attendu — 6 items :
+→ Item 1 : { "designation": "Amené et repli du matériel - Zone 1", "description": "", "quantity": 1.0, "unite": "FORF", "unit_price": 1150.0 }
+  ⚠️ description="" car le texte "Préparation du support" en dessous est l'ITEM 2, pas une description.
+→ Item 2 : { "designation": "Préparation du support", "description": "Ponçage diamant de la surface avec aspiration des poussières à la source. Ponçage diamant manuel des bords et des zones inaccessibles avec respiration à la source", "quantity": 1.0, "unite": "FORF", "unit_price": 2580.0 }
+→ Item 3 : { "designation": "Application du système", "description": "Fourniture et application d'une couche d'égalisation à raison de 2,5kg/m² saupoudrée à refus de silice. Fourniture et application d'une couche de fond à raison de 2,5kg/m² saupoudrée à refus. Fourniture et application d'une couche de garnissage époxy à raison de 650gr/m². Fourniture et application de relevés avec une gorge en mastic époxy dans l'angle sol/mur. Ponçage et aspiration de la zone entre chaque étape de l'intervention.", "quantity": 1.0, "unite": "FORF", "unit_price": 9480.0 }
+  ⚠️ La description inclut les 5 lignes de texte COMPLÈTES. Ne pas tronquer.
+→ Item 4 : { "designation": "Gorge et remonté de mur sur 1m", "description": "Mise en oeuvre de gorge périphérique au mortier de résine époxy. Remonté de mur en résine époxy teinte RAL 7040", "quantity": 46.0, "unite": "ML", "unit_price": 66.0 }
+→ Item 5 : { "designation": "Trie des déchets", "description": "", "quantity": 1.0, "unite": "FORF", "unit_price": 450.0 }
+  ⚠️ description="" car aucun texte descriptif, "TRAVAIL VENDREDI..." est l'item suivant.
+→ Item 6 : { "designation": "Travail vendredi - samedi - dimanche", "description": "", "quantity": 1.0, "unite": "FORF", "unit_price": 2220.0 }
+  ⚠️ "Zone accessible à partir du lundi" = CGV, PAS une description. description=""
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 FORMAT DE SORTIE — JSON STRICT, SANS MARKDOWN

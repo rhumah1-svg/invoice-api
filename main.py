@@ -420,6 +420,15 @@ def extract_metadata_regex(pdf_bytes: bytes, file_name: str) -> dict:
 # PROMPT VISION  (inchangé depuis V12/V13)
 # ═══════════════════════════════════════════════════════
 
+# ═══════════════════════════════════════════════════════
+# PROMPT VISION V15 — Corrections :
+#   1. Règle "Amené et repli" : description vide si pas de texte descriptif
+#   2. Règle "Cellule X - NOM" : inclure dans designation
+#   3. Règle formats numériques : 1 000 = 1000, virgule décimale
+#   4. Règle anti-mélange descriptions : frontière stricte entre items
+#   5. Nouveaux exemples few-shot couvrant ces cas
+# ═══════════════════════════════════════════════════════
+
 SYSTEM_PROMPT_VISION = """\
 Tu es un expert en extraction de données de devis de travaux BTP français.
 Ces devis sont toujours émis par la société QUALIDAL (13 avenue du Parc Alata, 60100 Creil).
@@ -456,7 +465,46 @@ Tu dois UNIQUEMENT retranscrire ce qui est VISUELLEMENT PRÉSENT dans les images
 Il est STRICTEMENT INTERDIT d'inventer, compléter, déduire ou paraphraser du contenu.
 Si un texte est partiellement illisible : recopie ce que tu vois, ne complète pas.
 Ne jamais fusionner le contenu de deux cellules différentes.
-La description d'un item se termine EXACTEMENT là où commence la ligne suivante avec une Qté.
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+⛔ RÈGLE ABSOLUE N°3 — FRONTIÈRE STRICTE ENTRE ITEMS
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Chaque item du tableau occupe UNE CELLULE dans la colonne Description.
+La FRONTIÈRE entre deux items est déterminée par la GRILLE DU TABLEAU :
+  → Là où une NOUVELLE LIGNE a ses propres valeurs Qté / U / P.U. HT / Montant HT,
+    c'est un NOUVEL ITEM. Tout le texte AU-DESSUS (dans la même cellule) appartient
+    à l'item PRÉCÉDENT. Tout le texte EN-DESSOUS appartient au NOUVEL item.
+
+MÉTHODE DE LECTURE — procéder item par item :
+  1. Repère la ligne avec le TITRE EN GRAS (ou le texte court) + les colonnes Qté/U/P.U. HT
+  2. Le texte en dessous DANS LA MÊME CELLULE = la description de CET item
+  3. DÈS qu'une nouvelle ligne a ses propres colonnes Qté/U/P.U. HT → STOP, c'est l'item suivant
+  4. Si entre le titre et les colonnes chiffrées il n'y a AUCUN texte descriptif → description = ""
+
+INTERDIT :
+  • Prendre le texte descriptif d'un item voisin pour remplir un item qui n'en a pas
+  • Fusionner deux cellules de description adjacentes
+  • Inventer une description quand la cellule n'en contient pas
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+⛔ RÈGLE ABSOLUE N°4 — NOMBRES ET FORMATS
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Les devis français utilisent :
+  • L'ESPACE comme séparateur de milliers : "1 560,00" = 1560.00, "10 000,00" = 10000.00
+  • La VIRGULE comme séparateur décimal : "7,70" = 7.7
+  • Parfois un point pour les milliers sur certains devis : "1.560,00" = 1560.00
+
+MÉTHODE pour convertir un prix ou quantité :
+  1. Supprimer tous les espaces dans le nombre
+  2. Remplacer la virgule par un point décimal
+  3. Résultat = float
+  Exemples : "1 560,00" → "1560,00" → 1560.0 | "28,50" → 28.5 | "1 760,00" → 1760.0
+
+VÉRIFICATION CROISÉE obligatoire :
+  Si Qté × P.U. HT ≠ Montant HT (à 1€ près) → relire les chiffres plus attentivement.
+  Exemples : 12 × 130 = 1560 ✓ | 18 × 63 = 1134 ✓ | 94 × 7.70 = 723.80 ✓
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 STRUCTURE GÉNÉRALE D'UN DEVIS QUALIDAL
@@ -557,6 +605,22 @@ NOM COURT de la prestation. 4 à 8 mots maximum.
 - Designation sans deux-points (ex: "Impact", "Benne") → valide comme les autres
 - Parenthèse informative → designation = texte AVANT la parenthèse
 
+RÈGLE CELLULES — quand le devis contient des sections "Cellule X - NOM" :
+  Les lignes "Cellule 1 - THEBAULT :", "Cellule 2 - MARTIN :" etc. sont des
+  TITRES DE SECTION (pas d'items). Les items qui suivent DOIVENT inclure le nom
+  de la cellule dans leur designation.
+  Format : "{prestation} - {Cellule X NOM}"
+  Exemples :
+    Item "Réparation épaufrures" sous "Cellule 1 - THEBAULT"
+    → designation = "Réparation épaufrures - Cellule 1 THEBAULT"
+    Item "Nettoyage joints construction plat" sous "Cellule 1 - THEBAULT"
+    → designation = "Nettoyage joints construction plat - Cellule 1 THEBAULT"
+    Item "Réparation épaufrures" sous "Cellule 2 - THEBAULT"
+    → designation = "Réparation épaufrures - Cellule 2 THEBAULT"
+
+  Cela permet de distinguer des items identiques dans des cellules différentes.
+  La cellule courante reste active jusqu'au prochain titre "Cellule X".
+
 RÈGLE SPÉCIALE devis AMO / contrôle qualité :
   Ces devis ont souvent un titre en GRAS ou MAJUSCULES suivi d'un long bloc descriptif.
   Si le titre de section (ex: "CONTRÔLE QUALITÉ DALLAGE DE 6 600M²") a Qté=0 ET prix=0
@@ -569,11 +633,22 @@ RÈGLE SPÉCIALE devis AMO / contrôle qualité :
 
 ── description ────────────────────────────────────
 
-Copier FIDÈLEMENT tout le texte de la cellule pour cet item.
-Inclure : texte principal, sous-sections, tirets, normes, dimensions.
-Exclure (CGV) : horaires de travail, fourniture eau/électricité, non-responsabilité
-Qualidal, mentions légales, conditions de paiement, délais, "BON POUR ACCORD".
-Pour une remise : description = "" (chaîne vide).
+La description est le texte qui se trouve DANS LA MÊME CELLULE du tableau,
+SOUS le titre/designation de l'item.
+
+RÈGLES STRICTES :
+  1. Si la cellule contient UNIQUEMENT le titre (ex: "AMENÉ ET REPLI DU MATÉRIEL - Zone 2")
+     SANS texte descriptif en dessous → description = "" (chaîne vide)
+  2. Ne JAMAIS emprunter le texte d'une cellule voisine pour remplir une description vide
+  3. La description se termine là où commence la CELLULE SUIVANTE du tableau
+  4. Inclure : texte principal, sous-sections, tirets, normes, dimensions
+  5. Exclure (CGV) : horaires de travail, fourniture eau/électricité, non-responsabilité
+     Qualidal, mentions légales, conditions de paiement, délais, "BON POUR ACCORD"
+  6. Pour une remise : description = "" (chaîne vide)
+
+CAS FRÉQUENT "Amené et repli du matériel" :
+  Cette ligne a presque toujours une description VIDE. Elle apparaît en début de devis
+  avec juste le titre + Qté 1 + FORF + prix. Ne lui attribuer AUCUNE description.
 
 ── quantity ───────────────────────────────────────
 
@@ -581,6 +656,10 @@ Valeur numérique de la colonne Qté. Toujours un float.
 Si vide : 0.0
 ATTENTION parenthèses : "Réparation seuil de porte : (2 unités à 4ml)   2,00"
 → quantity = 2.0 (la colonne Qté après ")"), PAS le "2" dans la parenthèse.
+
+ATTENTION FORMAT : les espaces sont des séparateurs de milliers.
+  "1 000,00" dans la colonne Qté → quantity = 1000.0 (pas 1.0)
+  "28,50" → 28.5
 
 ── unite ──────────────────────────────────────────
 
@@ -597,6 +676,10 @@ ATTENTION parenthèses : "Réparation seuil de porte : (2 unités à 4ml)   2,00
 
 Valeur colonne P.U. HT. Peut être négatif (remise). Si vide : 0.0
 
+ATTENTION FORMAT : les espaces sont des séparateurs de milliers.
+  "1 760,00" → 1760.0 (pas 1.0 ni 760.0)
+  "7,70" → 7.7
+
 ── Zones et sous-sections ─────────────────────────
 
 Titre de zone = pas de valeur dans Qté/U/P.U. HT/Montant HT → NE PAS créer d'item.
@@ -611,6 +694,8 @@ RÈGLE 6 — totals
   total_tax   : ligne "Total TVA"
   total_ttc   : ligne "Total TTC" ou "Net à payer"
 Si absent : 0.0
+
+ATTENTION : appliquer les mêmes règles de format numérique (espaces = milliers).
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 EXEMPLES RÉELS — FEW-SHOT
@@ -682,6 +767,49 @@ Sur un devis où tous les autres items sont en GRAS :
 
 "Plus-values :   —   —   0,00   0,00"
 → NE PAS créer d'item (prix = 0, texte informatif)
+
+── M — AMENÉ ET REPLI — description VIDE ──────────
+"AMENÉ ET REPLI DU MATÉRIEL - Zone 2   1,00   FORF   995,00   995,00"
+→ Cette ligne n'a PAS de texte descriptif dans sa cellule, juste le titre.
+→ { "designation": "Amené et repli du matériel - Zone 2", "description": "", "quantity": 1.0, "unite": "FORF", "unit_price": 995.0 }
+
+⚠️ NE PAS mettre "Sciage de part et d'autre..." en description ici !
+   Ce texte appartient à l'item SUIVANT (Réparation épaufrures).
+
+── N — Items avec CELLULES — designation contextualisée ──
+Section "Cellule 1 - THEBAULT :" (titre sans prix → pas d'item)
+Puis :
+"Réparation épaufrures.   1,00   ML   120,00   120,00"
+"Sciage de part et d'autre de l'épaufrure sur largeur requise..."
+→ { "designation": "Réparation épaufrures - Cellule 1 THEBAULT", "description": "Sciage de part et d'autre de l'épaufrure sur largeur requise et profondeur de 15 mm, piquage, nettoyage, aspiration, application d'un primaire d'accrochage et application d'un mortier de résine sans retrait. Surfaçage et reconstitution du joint, le cas échéant.", "quantity": 1.0, "unite": "ML", "unit_price": 120.0 }
+
+"Réparation de fissure inférieure à 5 mm d'ouverture par calfeutrement   28,50   ML   25,00   712,50"
+"avec un bi-composant epoxy."
+→ { "designation": "Réparation fissure inférieure à 5 mm - Cellule 1 THEBAULT", "description": "Réparation de fissure inférieure à 5 mm d'ouverture par calfeutrement avec un bi-composant epoxy.", "quantity": 28.5, "unite": "ML", "unit_price": 25.0 }
+
+Section "Cellule 2 - THEBAULT" (titre sans prix → pas d'item)
+"Réparation épaufrures.   0,10   ML   120,00   12,00"
+→ { "designation": "Réparation épaufrures - Cellule 2 THEBAULT", "description": "Sciage de part et d'autre de l'épaufrure sur largeur requise et profondeur de 15 mm, piquage, nettoyage, aspiration, application d'un primaire d'accrochage et application d'un mortier de résine sans retrait. Surfaçage et reconstitution du joint, le cas échéant.", "quantity": 0.1, "unite": "ML", "unit_price": 120.0 }
+
+── O — Prix avec espace millier ────────────────────
+"CAROTTE SUPPLÉMENTAIRE :   12,00   UNIT   130,00   1 560,00"
+→ Vérification : 12 × 130 = 1560 ✓
+→ { "designation": "Carotte supplémentaire", "description": "...", "quantity": 12.0, "unite": "U", "unit_price": 130.0 }
+
+"Rédaction d'une note de calcul...   1,00   UNIT   1 760,00   1 760,00"
+→ unit_price = 1760.0 (PAS 1.0 ni 760.0)
+→ { "designation": "Rédaction note de calcul", "description": "...", "quantity": 1.0, "unite": "U", "unit_price": 1760.0 }
+
+── P — Réparation divers Mortier — description propre ──
+"Réparation divers Mortier de résine (10x10cm).   2,00   UNIT   45,00   90,00"
+"Sciage périphérique de l'épaufrure sur largeur et profondeur requise,
+piquage, nettoyage, aspiration, application d'un primaire d'accrochage
+et application d'un mortier de résine sans retrait. Surfaçage final si nécessaire."
+→ { "designation": "Réparation divers mortier résine 10x10 - Cellule 1 THEBAULT", "description": "Sciage périphérique de l'épaufrure sur largeur et profondeur requise, piquage, nettoyage, aspiration, application d'un primaire d'accrochage et application d'un mortier de résine sans retrait. Surfaçage final si nécessaire.", "quantity": 2.0, "unite": "U", "unit_price": 45.0 }
+
+⚠️ La description de "Réparation divers Mortier (10x10)" est DIFFÉRENTE de
+   celle de "Réparation divers Mortier (20x20)" même si elles se ressemblent.
+   Chaque item a SA PROPRE cellule de description.
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 FORMAT DE SORTIE — JSON STRICT, SANS MARKDOWN

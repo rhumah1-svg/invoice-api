@@ -464,7 +464,27 @@ les items suivants doivent inclure " - Cellule X NOM" dans leur designation.
 Ex: sous "Cellule 3 -ZIEGLER :" → "Reprise ancrages - Cellule 3 ZIEGLER"
 
 ── description ──
-Texte entre la ligne de l'item et la prochaine ligne avec des chiffres.
+La description = le TEXTE COMPLET de la cellule pour cet item, y compris la ligne du titre.
+
+MÉTHODE :
+  1. Prendre la ligne qui contient les chiffres (Qté/P.U. HT) → extraire le texte AVANT les chiffres
+  2. Prendre toutes les lignes en dessous JUSQU'À la prochaine ligne avec des chiffres
+  3. Concaténer le tout = description complète
+
+Exemple :
+  "Rectification de planéité par ponçage Laser Grinder 1.00 FORF 192 940,00 ..."
+  "sur 3 voies de roulement (3 x 400 mm)"
+  "858 mètres linéaires d'allées étroites (13 allées de 66 m)"
+  "Conformité selon norme EN15620 DM2"
+  → designation = "Rectification de planéité par ponçage Laser Grinder"
+  → description = "Rectification de planéité par ponçage Laser Grinder sur 3 voies de roulement (3 x 400 mm) 858 mètres linéaires d'allées étroites (13 allées de 66 m) Conformité selon norme EN15620 DM2"
+
+Autre exemple :
+  "Réparation épaufrures. 134,00 ML 125,00 16 750,00 20,00"
+  "Sciage de part et d'autre de l'épaufrure..."
+  → designation = "Réparation épaufrures"
+  → description = "Réparation épaufrures. Sciage de part et d'autre de l'épaufrure..."
+
 Si AUCUN texte entre deux lignes chiffrées → description = "" (vide).
 Cas typiques avec description vide : "AMENÉ ET REPLI DU MATÉRIEL", "Trie des déchets",
 "Traitements des déchets", "TRAVAIL VENDREDI - SAMEDI - DIMANCHE".

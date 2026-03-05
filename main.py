@@ -1,16 +1,15 @@
 """
-Invoice/Quote PDF Extraction API - V15.0
-=========================================
-Modifications vs V14 :
-  1. choose_model V15 : nouveau critère "densité descriptive" (avg_desc_density)
-     - Détecte les devis avec descriptions longues entre les lignes de prix
-     - Score sur 10 points, seuil >= 2 pour gpt-4o
-  2. Prompt V15 : 4 nouvelles règles
-     - Règle N°3 : frontière stricte entre items (méthode 3 passes)
-     - Règle N°4 : formats numériques français (espaces milliers)
-     - Règle Cellules : "Cellule X - NOM" dans designation
-     - Règle description vide : Amené et repli, Trie des déchets, etc.
-  3. 5 nouveaux exemples few-shot (M, N, O, P, Q)
+Invoice/Quote PDF Extraction API - V16.0 HYBRID
+=================================================
+Changement majeur vs V15 :
+  Mode HYBRIDE : pdfplumber extrait le TEXTE du PDF, envoyé à gpt-4o-mini.
+  Plus besoin d'images → 5-8s au lieu de 30-40s, coût /10.
+
+  - extract_with_text() : nouvelle fonction principale (texte pdfplumber → LLM)
+  - extract_with_vision() : conservée en FALLBACK si pdfplumber échoue
+  - Prompt TEXTE simplifié (~4000 tokens au lieu de ~7500)
+  - Modèle par défaut : gpt-4o-mini (suffisant en mode texte)
+  - choose_model() conservé pour le fallback vision uniquement
 """
 
 import os, io, logging, base64, re, gc, json
@@ -234,7 +233,7 @@ def pdf_bytes_to_images_b64(pdf_bytes: bytes, dpi: int = 200) -> list[str]:
         for page in doc:
             mat = fitz.Matrix(dpi / 72, dpi / 72)
             pix = page.get_pixmap(matrix=mat, alpha=False)
-            buf = io.BytesIO(pix.tobytes("jpeg", jpg_quality=92))
+            buf = io.BytesIO(pix.tobytes("jpeg", jpg_quality=75))
             out.append(base64.b64encode(buf.getvalue()).decode())
         doc.close()
         logger.info(f"[vision] pymupdf {len(out)} page(s) @ {dpi} DPI")
@@ -248,7 +247,7 @@ def pdf_bytes_to_images_b64(pdf_bytes: bytes, dpi: int = 200) -> list[str]:
         out = []
         for img in images:
             buf = io.BytesIO()
-            img.save(buf, format="JPEG", quality=92)
+            img.save(buf, format="JPEG", quality=75)
             out.append(base64.b64encode(buf.getvalue()).decode())
         logger.info(f"[vision] pdf2image {len(out)} page(s)")
         return out
@@ -372,7 +371,238 @@ def extract_metadata_regex(pdf_bytes: bytes, file_name: str) -> dict:
 
 
 # ═══════════════════════════════════════════════════════
-# PROMPT VISION  — V15
+# EXTRACTION TEXTE PDFPLUMBER
+# ═══════════════════════════════════════════════════════
+
+def extract_text_from_pdf(pdf_bytes: bytes) -> str:
+    """Extrait le texte de toutes les pages du PDF via pdfplumber."""
+    all_text = ""
+    try:
+        with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf:
+            for page in pdf.pages:
+                all_text += (page.extract_text() or "") + "\n"
+    except Exception as e:
+        logger.warning(f"[text] pdfplumber échoué: {e}")
+        return ""
+    return all_text.strip()
+
+
+# ═══════════════════════════════════════════════════════
+# PROMPT TEXTE — V16 (optimisé pour texte pdfplumber)
+# ═══════════════════════════════════════════════════════
+
+SYSTEM_PROMPT_TEXT = """\
+Tu es un expert en extraction de données de devis de travaux BTP français.
+Ces devis sont émis par QUALIDAL (13 avenue du Parc Alata, 60100 Creil).
+Tu reçois le TEXTE BRUT extrait d'un PDF de devis (via pdfplumber).
+Retourne UNIQUEMENT un JSON valide, sans texte ni markdown autour.
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+COMMENT LIRE LE TEXTE EXTRAIT
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Le texte provient d'un tableau PDF avec colonnes : Description | Qté | U | P.U. HT | Montant HT | TVA
+
+Chaque ITEM est identifiable par une ligne contenant des CHIFFRES à la fin :
+  "Réparation épaufrures. 28,00 ML 120,00 3 360,00 20,00"
+  → C'est un item : designation="Réparation épaufrures", Qté=28, U=ML, P.U.HT=120, Montant=3360
+
+Les lignes SANS chiffres qui suivent = la DESCRIPTION de l'item précédent :
+  "Sciage de part et d'autre de l'épaufrure sur largeur requise..."
+  → Description de "Réparation épaufrures"
+
+Les lignes avec "0,00 0,00 0,00 0,00" = séparateurs, titres de section, ou CGV → PAS d'items.
+
+ATTENTION aux espaces dans les nombres :
+  "1 022,00" = 1022.0 (espace = séparateur milliers)
+  "16 750,00" = 16750.0
+  "1 500,00" = 1500.0
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+RÈGLE 1 — vendor_name
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Entreprise CLIENTE (pas Qualidal). Chercher après "Monsieur/Madame" → ligne suivante.
+Sinon : première ligne en majuscules après le bloc Qualidal.
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+RÈGLE 2 — project_name
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Valeur de la ligne "Chantier" dans le tableau récapitulatif.
+Si courte, compléter avec "Adresse du chantier" ou "Ref Cde".
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+RÈGLE 3 — invoice_number
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Chercher "DE" + 4-10 chiffres → format "devis_de" + 8 chiffres min.
+DE00005612 → "devis_de00005612"
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+RÈGLE 4 — date
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Colonne "Date" du tableau récapitulatif → AAAA-MM-JJ. Si absente : "".
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+RÈGLE 5 — LINE ITEMS
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Un item valide = une ligne avec P.U. HT ≠ 0 OU Montant HT ≠ 0.
+
+NE PAS créer d'item pour :
+  • Lignes "0,00 0,00 0,00 0,00" (séparateurs/titres/CGV)
+  • Sous-totaux, totaux, CGV, "BON POUR ACCORD"
+  • Titres de section sans prix (ex: "MISSION CAPACITÉ DE CHARGE..." avec 0,00)
+
+── designation ──
+NOM COURT (4-8 mots). Première ligne de l'item, sans la description technique.
+
+CELLULES : si le texte contient "Cellule X - NOM :" avec 0,00 (titre de section),
+les items suivants doivent inclure " - Cellule X NOM" dans leur designation.
+Ex: sous "Cellule 3 -ZIEGLER :" → "Reprise ancrages - Cellule 3 ZIEGLER"
+
+── description ──
+Texte entre la ligne de l'item et la prochaine ligne avec des chiffres.
+Si AUCUN texte entre deux lignes chiffrées → description = "" (vide).
+Cas typiques avec description vide : "AMENÉ ET REPLI DU MATÉRIEL", "Trie des déchets",
+"Traitements des déchets", "TRAVAIL VENDREDI - SAMEDI - DIMANCHE".
+Ne JAMAIS prendre le texte d'un item voisin.
+Copier la description ENTIÈRE sans tronquer.
+
+── quantity, unite, unit_price ──
+Lire les chiffres sur la ligne de l'item.
+Espaces = séparateurs de milliers : "1 022,00" = 1022.0
+Virgule = décimal : "4,60" = 4.6
+Unités : FORF/ML/M2/UNIT→U/Heures/Jours/Semaine
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+RÈGLE 6 — totals
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Chercher la ligne "Total HT ... Total TVA ... Total TTC" → extraire les valeurs.
+Appliquer les mêmes règles de format numérique.
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+FORMAT DE SORTIE — JSON STRICT
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+{
+  "metadata": {
+    "vendor_name": "...",
+    "project_name": "...",
+    "invoice_number": "devis_deXXXXXXXX",
+    "date": "YYYY-MM-DD",
+    "currency": "EUR"
+  },
+  "line_items": [
+    {
+      "designation": "...",
+      "description": "...",
+      "quantity": 0.0,
+      "unite": "...",
+      "unit_price": 0.0
+    }
+  ],
+  "totals": {
+    "subtotal_ht": 0.0,
+    "total_tax": 0.0,
+    "total_ttc": 0.0
+  }
+}"""
+
+
+# ═══════════════════════════════════════════════════════
+# EXTRACTION HYBRIDE — V16 : texte d'abord, vision en fallback
+# ═══════════════════════════════════════════════════════
+
+async def extract_with_text(
+    pdf_bytes: bytes,
+    openai_client: AsyncOpenAI
+) -> tuple[InvoiceData, str]:
+    """
+    V16 HYBRIDE : extrait le texte via pdfplumber puis l'envoie à gpt-4o-mini.
+    Fallback sur extract_with_vision si pdfplumber échoue.
+    """
+    import time
+    t0 = time.time()
+
+    # Étape 1 : extraire le texte
+    pdf_text = extract_text_from_pdf(pdf_bytes)
+    t1 = time.time()
+    logger.info(f"[perf] pdfplumber: {t1-t0:.1f}s | {len(pdf_text)} chars")
+
+    # Si pdfplumber retourne peu de texte → fallback vision
+    if len(pdf_text) < 100:
+        logger.warning("[text] Texte trop court, fallback vision")
+        return await extract_with_vision(pdf_bytes, openai_client)
+
+    # Étape 2 : envoyer le texte à gpt-4o-mini
+    model = os.getenv("OPENAI_MODEL", "").strip() or "gpt-4o-mini"
+    logger.info(f"[text] Mode texte → {model} | {len(pdf_text)//4} tokens estimés")
+
+    last_error = None
+    for attempt in range(1, 3):
+        try:
+            resp = await openai_client.chat.completions.create(
+                model=model,
+                max_tokens=4000,
+                temperature=0,
+                messages=[
+                    {"role": "system", "content": SYSTEM_PROMPT_TEXT},
+                    {"role": "user",   "content": f"Voici le texte extrait du devis Qualidal :\n\n{pdf_text}"}
+                ]
+            )
+        except Exception as e:
+            logger.exception(f"[text] Erreur OpenAI tentative {attempt}")
+            last_error = e
+            continue
+
+        finish_reason = resp.choices[0].finish_reason
+        raw = resp.choices[0].message.content.strip()
+        raw = re.sub(r'^```(?:json)?\s*', '', raw, flags=re.MULTILINE)
+        raw = re.sub(r'\s*```$',          '', raw, flags=re.MULTILINE).strip()
+
+        if finish_reason == "length":
+            logger.warning(f"[text] Tentative {attempt} tronquée. Retry...")
+            last_error = Exception("Réponse tronquée")
+            continue
+
+        try:
+            data = json.loads(raw)
+            break
+        except json.JSONDecodeError as e:
+            logger.error(f"[text] Tentative {attempt} JSON invalide: {e}\n{raw[:400]}")
+            last_error = e
+            continue
+    else:
+        raise HTTPException(status_code=500, detail=f"Extraction texte échouée après 2 tentatives: {last_error}")
+
+    # Sécurité invoice_number
+    inv = data.get("metadata", {}).get("invoice_number", "")
+    m = re.search(r'DE(\d{4,10})', inv, re.IGNORECASE)
+    if m:
+        data["metadata"]["invoice_number"] = f"devis_de{m.group(1).zfill(8)}"
+
+    n_items = len(data.get("line_items", []))
+    t2 = time.time()
+    logger.info(f"[perf] OpenAI: {t2-t1:.1f}s | {model} | {n_items} item(s)")
+    logger.info(f"[perf] TOTAL: {t2-t0:.1f}s (mode texte)")
+
+    if n_items == 0:
+        logger.warning("[text] ⚠ 0 items — tentative fallback vision")
+        return await extract_with_vision(pdf_bytes, openai_client)
+
+    try:
+        return InvoiceData(**data), f"{model} (text)"
+    except Exception as e:
+        logger.error(f"[text] Pydantic: {e} — fallback vision")
+        return await extract_with_vision(pdf_bytes, openai_client)
+
+
+# ═══════════════════════════════════════════════════════
+# PROMPT VISION  — V15 (conservé pour fallback)
 # ═══════════════════════════════════════════════════════
 
 SYSTEM_PROMPT_VISION = """\
@@ -879,17 +1109,24 @@ async def extract_with_vision(
 ) -> tuple[InvoiceData, str]:
     """
     Retourne (InvoiceData, model_used).
-    V15 : sélection automatique du modèle par analyse du contenu PDF.
+    V15 : sélection automatique du modèle + optimisations perf (DPI 150, JPEG 75).
     """
+    import time
+    t0 = time.time()
+
     try:
-        images_b64 = pdf_bytes_to_images_b64(pdf_bytes, dpi=200)
+        images_b64 = pdf_bytes_to_images_b64(pdf_bytes, dpi=150)
     except RuntimeError as e:
         raise HTTPException(status_code=500, detail=str(e))
 
+    t1 = time.time()
     n_pages = len(images_b64)
+    img_sizes_kb = [len(b) * 3 / 4 / 1024 for b in images_b64]  # base64 → bytes approx
+    logger.info(f"[perf] PDF→images: {t1-t0:.1f}s | {n_pages} page(s) | {sum(img_sizes_kb):.0f} KB total")
 
     model = choose_model(pdf_bytes)
-    logger.info(f"[vision] {n_pages} page(s) → modèle sélectionné : {model}")
+    t2 = time.time()
+    logger.info(f"[perf] choose_model: {t2-t1:.1f}s → {model}")
 
     content = [{
         "type": "text",
@@ -949,6 +1186,9 @@ async def extract_with_vision(
         data["metadata"]["invoice_number"] = f"devis_de{m.group(1).zfill(8)}"
 
     n_items = len(data.get("line_items", []))
+    t3 = time.time()
+    logger.info(f"[perf] OpenAI API: {t3-t2:.1f}s | {model} | {n_items} item(s)")
+    logger.info(f"[perf] TOTAL extract_with_vision: {t3-t0:.1f}s")
     logger.info(f"[vision] ✓ {model} — {n_items} item(s) extraits")
     if n_items == 0:
         logger.warning("[vision] ⚠ AUCUN item extrait — vérifier le PDF")
@@ -964,7 +1204,7 @@ async def extract_with_vision(
 # APP & ROUTES
 # ═══════════════════════════════════════════════════════
 
-app = FastAPI(title="Invoice Extraction API", version="15.0.0")
+app = FastAPI(title="Invoice Extraction API", version="16.0.0")
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
 
 def get_openai_client() -> AsyncOpenAI:
@@ -1003,9 +1243,10 @@ async def upload_pdf_to_bubble(pdf_bytes: bytes, filename: str) -> str:
 async def health():
     return {
         "status": "ok",
-        "version": "15.0.0",
-        "model_selection": "auto V15 (ratio texte/prix, mots-clés AMO, densité descriptive)",
-        "model_override": os.getenv("OPENAI_MODEL", "non défini — mode auto actif"),
+        "version": "16.0.0",
+        "mode": "hybrid (text first, vision fallback)",
+        "model_default": "gpt-4o-mini (text mode)",
+        "model_override": os.getenv("OPENAI_MODEL", "non défini — gpt-4o-mini par défaut"),
     }
 
 
@@ -1032,7 +1273,7 @@ async def extract_invoice(file: UploadFile = File(...)):
     try:
         pdf_bytes = await file.read()
         filename  = file.filename or "devis.pdf"
-        data, model_used = await extract_with_vision(pdf_bytes, get_openai_client())
+        data, model_used = await extract_with_text(pdf_bytes, get_openai_client())
         file_url  = await upload_pdf_to_bubble(pdf_bytes, filename)
         del pdf_bytes; gc.collect()
         return ExtractionResponse(success=True, data=data, file_url=file_url, model_used=model_used)
@@ -1090,7 +1331,7 @@ async def split_and_extract(file: UploadFile = File(...)):
 
         for part in parts:
             try:
-                data, model_used = await extract_with_vision(part["pdf_bytes"], openai_client)
+                data, model_used = await extract_with_text(part["pdf_bytes"], openai_client)
                 b64  = base64.b64encode(part["pdf_bytes"]).decode()
                 results.append(SplitExtractItem(
                     file_name=part["file_name"],

@@ -267,7 +267,7 @@ class SplitExtractResponse(BaseModel):
 # PDF → IMAGES BASE64
 # ═══════════════════════════════════════════════════════
 
-def pdf_bytes_to_images_b64(pdf_bytes: bytes, dpi: int = 200) -> list[str]:
+def pdf_bytes_to_images_b64(pdf_bytes: bytes, dpi: int = 150) -> list[str]:
     """
     Chaque page du PDF → JPEG base64.
     DPI 200 pour meilleure lisibilité des tableaux serrés.
@@ -853,7 +853,7 @@ async def extract_with_vision(
     V14 : sélection automatique du modèle par analyse du contenu PDF.
     """
     try:
-        images_b64 = pdf_bytes_to_images_b64(pdf_bytes, dpi=200)
+        images_b64 = pdf_bytes_to_images_b64(pdf_bytes, dpi=150)
     except RuntimeError as e:
         raise HTTPException(status_code=500, detail=str(e))
 
@@ -861,20 +861,24 @@ async def extract_with_vision(
 
     # V14 : choose_model analyse le contenu (remplace get_model basé sur nb pages)
     model = choose_model(pdf_bytes)
-    logger.info(f"[vision] {n_pages} page(s) → modèle sélectionné : {model}")
+with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf:
+    raw_text = "\n".join(p.extract_text() or "" for p in pdf.pages)
 
-    content = [{
-        "type": "text",
-        "text": (
-            f"Voici les {n_pages} page(s) d'un devis Qualidal. "
-            "IMPORTANT : parcours TOUTES les pages et extrait TOUS les items avec P.U. HT ≠ 0. "
-            "Retourne UNIQUEMENT le JSON complet."
-        )
-    }]
+logger.info(f"[vision] {n_pages} page(s) → modèle sélectionné : {model}")
+
+content = [{
+    "type": "text",
+    "text": (
+        f"Voici les {n_pages} page(s) d'un devis Qualidal. "
+        "IMPORTANT : parcours TOUTES les pages et extrait TOUS les items avec P.U. HT ≠ 0. "
+        "Retourne UNIQUEMENT le JSON complet.\n\n"
+        f"Texte brut extrait du PDF :\n{raw_text[:4000]}"
+    )
+}]
     for img_b64 in images_b64:
         content.append({
             "type": "image_url",
-            "image_url": {"url": f"data:image/jpeg;base64,{img_b64}", "detail": "high"}
+            "image_url": {"url": f"data:image/jpeg;base64,{img_b64}", "detail": "auto"}
         })
 
     last_error = None

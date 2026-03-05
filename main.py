@@ -558,16 +558,29 @@ async def extract_with_text(
         logger.warning("[text] Texte trop court, fallback vision")
         return await extract_with_vision(pdf_bytes, openai_client)
 
-    # Étape 2 : envoyer le texte à gpt-4o-mini
-    model = os.getenv("OPENAI_MODEL", "").strip() or "gpt-4o-mini"
-    logger.info(f"[text] Mode texte → {model} | {len(pdf_text)//4} tokens estimés")
+    # Étape 2 : choisir le modèle selon la complexité du devis
+    override = os.getenv("OPENAI_MODEL", "").strip()
+    if override in ("gpt-4o", "gpt-4o-mini"):
+        model = override
+    else:
+        # Critères simples pour le mode texte :
+        # - Texte long (>5000 chars) → gpt-4o (devis complexes multi-pages)
+        # - Sinon → gpt-4o-mini (rapide, suffisant pour devis standards)
+        if len(pdf_text) > 5000:
+            model = "gpt-4o"
+        else:
+            model = "gpt-4o-mini"
+
+    # max_tokens adaptatif : gros devis → plus de place pour la réponse
+    max_tok = 8000 if len(pdf_text) > 5000 else 4000
+    logger.info(f"[text] Mode texte → {model} | {len(pdf_text)} chars (~{len(pdf_text)//4} tokens) | max_tokens={max_tok}")
 
     last_error = None
     for attempt in range(1, 3):
         try:
             resp = await openai_client.chat.completions.create(
                 model=model,
-                max_tokens=4000,
+                max_tokens=max_tok,
                 temperature=0,
                 messages=[
                     {"role": "system", "content": SYSTEM_PROMPT_TEXT},

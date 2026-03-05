@@ -68,18 +68,37 @@ _AMO_KEYWORDS = [
 ]
 
 
+# ═══════════════════════════════════════════════════════
+# PATCH choose_model() — V15
+# ═══════════════════════════════════════════════════════
+#
+# CHANGEMENTS vs V14 :
+#   1. Nouveau critère 6 : "densité descriptive" — détecte les devis avec
+#      des blocs de texte longs entre les lignes de prix (comme le devis
+#      XPO Aéroparc "Système Semi Lisse"). Ces devis sont difficiles pour
+#      gpt-4o-mini car les frontières entre items ne sont pas visuellement
+#      claires.
+#   2. Score max passe de 8 à 10 points, seuil reste à ≥ 2
+#   3. Log amélioré avec toutes les métriques
+#
+# Pour appliquer : remplacer la fonction choose_model() dans main.py
+# ═══════════════════════════════════════════════════════
+
 def choose_model(pdf_bytes: bytes) -> str:
     """
     Sélection intelligente du modèle OpenAI selon la COMPLEXITÉ du devis.
 
-    Analyse 4 métriques objectives extraites du texte pdfplumber :
-      1. ratio_texte_prix  : caractères totaux / nb lignes avec prix
-      2. avg_line_length   : longueur moyenne des lignes
-      3. keyword_hits      : nb de mots-clés AMO détectés
-      4. lignes_vs_chars   : peu de prix pour beaucoup de texte
+    Analyse 6 métriques objectives extraites du texte pdfplumber :
+      1. nb_pages          : nombre de pages
+      2. ratio_texte_prix  : caractères totaux / nb lignes avec prix
+      3. avg_line_length   : longueur moyenne des lignes
+      4. keyword_hits      : nb de mots-clés AMO détectés
+      5. lignes_vs_chars   : peu de prix pour beaucoup de texte
+      6. desc_density      : nb moyen de lignes de texte entre deux lignes de prix
+                             (détecte les devis avec descriptions denses)
 
-    Score → gpt-4o si ≥ 3, sinon gpt-4o-mini.
-    Override via env var OPENAI_MODEL (Render).
+    Score sur 10 → gpt-4o si score ≥ 2, sinon gpt-4o-mini.
+    Override via env var OPENAI_MODEL.
     """
     # Override manuel toujours prioritaire
     override = os.getenv("OPENAI_MODEL", "").strip()
@@ -92,6 +111,9 @@ def choose_model(pdf_bytes: bytes) -> str:
         total_chars  = 0
         total_lines  = 0
         lines_with_prices = 0
+        # V15 : comptage des lignes de texte entre les lignes de prix
+        text_lines_between_prices = []  # liste des gaps entre lignes prix
+        current_gap = 0
 
         with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf:
             n_pages = len(pdf.pages)
@@ -106,13 +128,27 @@ def choose_model(pdf_bytes: bytes) -> str:
                     # Ligne avec prix = contient un nombre type "1 500,00" ou "27 500,00"
                     if re.search(r'\d[\d\s]{2,},\d{2}', line):
                         lines_with_prices += 1
+                        # V15 : enregistrer le gap depuis la dernière ligne prix
+                        if current_gap > 0:
+                            text_lines_between_prices.append(current_gap)
+                        current_gap = 0
+                    else:
+                        current_gap += 1
 
         # ── Métriques ──────────────────────────────────────────
-        # Éviter division par zéro
         ratio_texte_prix = total_chars / max(lines_with_prices, 1)
         avg_line_length  = total_chars / max(total_lines, 1)
 
-        # Comptage mots-clés AMO (insensible à la casse)
+        # V15 : densité descriptive = nombre moyen de lignes de texte entre les lignes de prix
+        # Devis simple : ~0-1 (juste titre + chiffres)
+        # Devis dense  : ~3-6 (titre + description multi-lignes + chiffres)
+        avg_desc_density = (
+            sum(text_lines_between_prices) / len(text_lines_between_prices)
+            if text_lines_between_prices else 0
+        )
+        max_desc_gap = max(text_lines_between_prices) if text_lines_between_prices else 0
+
+        # Comptage mots-clés AMO
         full_text_lower = full_text.lower()
         keyword_hits = sum(
             1 for kw in _AMO_KEYWORDS
@@ -123,26 +159,22 @@ def choose_model(pdf_bytes: bytes) -> str:
         score   = 0
         reasons = []
 
-        # Critère 1 : 3 pages ou plus → risque d'items manqués, 4o plus fiable
-        # Reprend la règle de V13 (get_model basé sur nb pages)
+        # Critère 1 : 3 pages ou plus → risque d'items manqués
         if n_pages >= 3:
             score += 2
             reasons.append(f"nb_pages={n_pages}>=3 (+2)")
 
         # Critère 2 : beaucoup de texte pour peu de lignes tarifées
-        # Devis simple : ~400  | Devis AMO : ~3000+
         if ratio_texte_prix > 1500:
             score += 2
             reasons.append(f"ratio_texte_prix={ratio_texte_prix:.0f}>1500 (+2)")
 
         # Critère 3 : lignes longues = descriptions denses
-        # Devis simple : ~35 chars | Devis AMO : ~70+ chars
         if avg_line_length > 60:
             score += 1
             reasons.append(f"avg_line_length={avg_line_length:.0f}>60 (+1)")
 
-        # Critère 4 : mots-clés AMO (le plus discriminant)
-        # 2+ hits = clairement un devis de prestations intellectuelles
+        # Critère 4 : mots-clés AMO
         if keyword_hits >= 2:
             score += 2
             reasons.append(f"keyword_hits={keyword_hits}>=2 (+2)")
@@ -151,25 +183,34 @@ def choose_model(pdf_bytes: bytes) -> str:
             reasons.append(f"keyword_hits={keyword_hits}=1 (+1)")
 
         # Critère 5 : très peu d'items pour un PDF dense
-        # Signale un devis avec de gros blocs texte et peu de lignes de prix
         if lines_with_prices <= 4 and total_chars > 2000:
             score += 1
             reasons.append(f"peu_de_prix={lines_with_prices}<=4 (+1)")
 
+        # Critère 6 (V15) : densité descriptive élevée
+        # Si en moyenne il y a 3+ lignes de texte entre chaque ligne de prix,
+        # OU si un bloc dépasse 5 lignes, c'est un devis avec descriptions denses
+        # que gpt-4o-mini risque de mal découper.
+        if avg_desc_density >= 3:
+            score += 2
+            reasons.append(f"avg_desc_density={avg_desc_density:.1f}>=3 (+2)")
+        elif max_desc_gap >= 5:
+            score += 1
+            reasons.append(f"max_desc_gap={max_desc_gap}>=5 (+1)")
+
         # ── Décision ────────────────────────────────────────────
-        # Seuil 2 : nb_pages>=3 seul (score=2) suffit à déclencher 4o
-        # car les devis longs ont plus de risques d'items manqués en fin de tableau
         model = "gpt-4o" if score >= 2 else "gpt-4o-mini"
 
         logger.info(
-            f"[choose_model] score={score}/7 → {model} | "
+            f"[choose_model] score={score}/10 → {model} | "
+            f"pages={n_pages} lines_prix={lines_with_prices} "
+            f"avg_desc_density={avg_desc_density:.1f} max_gap={max_desc_gap} | "
             f"raisons: {' | '.join(reasons) if reasons else 'devis standard'}"
         )
 
         return model
 
     except Exception as e:
-        # En cas d'erreur d'analyse (PDF corrompu, etc.) → fallback safe
         logger.warning(f"[choose_model] erreur analyse PDF → fallback gpt-4o-mini : {e}")
         return "gpt-4o-mini"
 
@@ -420,6 +461,7 @@ def extract_metadata_regex(pdf_bytes: bytes, file_name: str) -> dict:
 # PROMPT VISION  (inchangé depuis V12/V13)
 # ═══════════════════════════════════════════════════════
 
+# ═══════════════════════════════════════════════════════
 # ═══════════════════════════════════════════════════════
 # ═══════════════════════════════════════════════════════
 # PROMPT VISION V15 — Corrections :

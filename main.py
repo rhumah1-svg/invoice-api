@@ -1,6 +1,7 @@
 """
-Invoice/Quote PDF Extraction API - V17.0 PURE EXTRACT
-=====================================================
+Invoice/Quote PDF Extraction API - V17.0 PURE EXTRACT (CORRIGÉE)
+================================================================
+- FIX : Résolution de l'erreur "SyntaxError: unterminated string literal".
 - FOCUS UNIQUE : Extraction de données (Plus de /split).
 - VITESSE & PRÉCISION : Utilisation de `layout=True` pour pdfplumber.
 - CORRECTION BUGS : Prompt strict sur le formatage des nombres (4 000 -> 4000.0).
@@ -11,7 +12,6 @@ import os
 import io
 import logging
 import base64
-import re
 import gc
 import json
 import httpx
@@ -222,11 +222,112 @@ async def extract_with_vision(pdf_bytes: bytes, openai_client: AsyncOpenAI) -> t
                 messages=[{"role": "system", "content": SYSTEM_PROMPT}, {"role": "user", "content": content}]
             )
             raw = resp.choices[0].message.content.strip()
-            raw = re.sub(r'^
-http://googleusercontent.com/immersive_entry_chip/0
-http://googleusercontent.com/immersive_entry_chip/1
+            # Nettoyage sécurisé sans expressions régulières
+            raw = raw.replace("```json", "").replace("```", "").strip()
+            data = json.loads(raw)
+            break
+        except Exception as e:
+            last_error = e
+            continue
+    else:
+        raise HTTPException(status_code=500, detail=f"Vision JSON invalide: {last_error}")
 
-### Pourquoi cette version va tout changer pour toi :
-1. **La vitesse** : On ne boucle plus sur des "parties". Le fichier arrive, on lit le texte, on l'envoie à OpenAI, terminé. 
-2. **La robustesse `layout=True`** : Quand OpenAI recevait le texte avant, il voyait : `Nettoyage 150 15 2250`. Maintenant, il verra : `Nettoyage                 150      15       2250`. Il comprendra visuellement où sont les colonnes.
-3. **Moins de lignes de code = Moins de bugs potentiels.** Tu peux tester ça directement avec ton fichier `start.bat`. Dis-moi si tu constates une amélioration sur le fameux problème des espaces dans les milliers !
+    return InvoiceData(**data), f"{model} (vision)"
+
+async def extract_with_text(pdf_bytes: bytes, openai_client: AsyncOpenAI) -> tuple[InvoiceData, str]:
+    import time
+    t0 = time.time()
+    
+    pdf_text = extract_text_from_pdf(pdf_bytes)
+    
+    # Si le PDF est un scan (pas de texte) -> bascule immédiate sur Vision
+    if len(pdf_text) < 100:
+        logger.warning("[text] Texte trop court, fallback vision")
+        return await extract_with_vision(pdf_bytes, openai_client)
+
+    model = "gpt-4o" if len(pdf_text) > 5000 else "gpt-4o-mini"
+    max_tok = 8000 if len(pdf_text) > 5000 else 4000
+
+    last_error = None
+    for attempt in range(1, 3):
+        try:
+            resp = await openai_client.chat.completions.create(
+                model=model, max_tokens=max_tok, temperature=0,
+                messages=[
+                    {"role": "system", "content": SYSTEM_PROMPT},
+                    {"role": "user", "content": f"Texte du devis (formaté avec espaces) :\n\n{pdf_text}"}
+                ]
+            )
+            raw = resp.choices[0].message.content.strip()
+            # Nettoyage sécurisé sans expressions régulières
+            raw = raw.replace("```json", "").replace("```", "").strip()
+            data = json.loads(raw)
+            break
+        except Exception as e:
+            last_error = e
+            continue
+    else:
+        raise HTTPException(status_code=500, detail=f"Text JSON invalide: {last_error}")
+
+    n_items = len(data.get("line_items", []))
+    if n_items == 0:
+        logger.warning("[text] 0 items trouvés -> fallback vision")
+        return await extract_with_vision(pdf_bytes, openai_client)
+
+    return InvoiceData(**data), f"{model} (text)"
+
+# ═══════════════════════════════════════════════════════
+# BUBBLE UPLOAD & APP FASTAPI
+# ═══════════════════════════════════════════════════════
+
+app = FastAPI(title="Invoice Extraction API", version="17.0.0 (Pure Extract)")
+app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
+
+def get_openai_client() -> AsyncOpenAI:
+    key = os.getenv("OPENAI_API_KEY")
+    if not key: raise RuntimeError("OPENAI_API_KEY manquant")
+    return AsyncOpenAI(api_key=key)
+
+async def upload_pdf_to_bubble(pdf_bytes: bytes, filename: str) -> str:
+    bubble_token = os.getenv("BUBBLE_API_KEY", "")
+    bubble_base  = os.getenv("BUBBLE_BASE_URL", "https://www.portail-qualidal.com/version-test")
+    if not bubble_token: return ""
+    
+    upload_url = f"{bubble_base}/api/1.1/files/uploadprivate"
+    try:
+        async with httpx.AsyncClient(timeout=60) as client:
+            resp = await client.post(
+                upload_url,
+                headers={"Authorization": f"Bearer {bubble_token}"},
+                files={"file": (filename, pdf_bytes, "application/pdf")},
+            )
+            resp.raise_for_status()
+            return resp.json().get("fileUrl", "")
+    except Exception as e:
+        logger.warning(f"Upload Bubble échoué : {e}")
+        return ""
+
+@app.get("/health")
+async def health():
+    return {"status": "ok", "version": "17.0.0", "mode": "Pure Extract Hybrid"}
+
+@app.post("/extract", response_model=ExtractionResponse)
+async def extract_invoice(file: UploadFile = File(...)):
+    try:
+        pdf_bytes = await file.read()
+        filename  = file.filename or "devis.pdf"
+        
+        # 1. Extraction des données (Texte d'abord, Vision si besoin)
+        data, model_used = await extract_with_text(pdf_bytes, get_openai_client())
+        
+        # 2. Upload sur Bubble
+        file_url = await upload_pdf_to_bubble(pdf_bytes, filename)
+        
+        del pdf_bytes; gc.collect()
+        return ExtractionResponse(success=True, data=data, file_url=file_url, model_used=model_used)
+        
+    except HTTPException as e:
+        return ExtractionResponse(success=False, error=e.detail)
+    except Exception as e:
+        logger.exception("Error /extract")
+        return ExtractionResponse(success=False, error=str(e))

@@ -1,5 +1,5 @@
 """
-Invoice/Quote PDF Extraction API - V17.0 PURE EXTRACT (CORRIGÉE)
+Invoice/Quote PDF Extraction API - V17.1 PURE EXTRACT (OPTIMISÉE)
 ================================================================
 - FIX : Résolution de l'erreur "SyntaxError: unterminated string literal".
 - FOCUS UNIQUE : Extraction de données (Plus de /split).
@@ -7,6 +7,7 @@ Invoice/Quote PDF Extraction API - V17.0 PURE EXTRACT (CORRIGÉE)
 - CORRECTION BUGS : Prompt strict sur le formatage des nombres (4 000 -> 4000.0).
 - RETOURS À LA LIGNE : Préservation stricte des sauts de ligne (\n) dans les descriptions.
 - MODE HYBRIDE : Texte d'abord (gpt-4o-mini), Vision en secours.
+- PERF V17.1 : Exécution simultanée (asyncio.gather) de l'IA et de l'upload Bubble.
 """
 
 import os
@@ -15,7 +16,6 @@ import logging
 import base64
 import gc
 import json
-import httpx
 from typing import Optional
 
 import pdfplumber
@@ -88,7 +88,6 @@ class ExtractionResponse(BaseModel):
     success:    bool
     data:       Optional[InvoiceData] = None
     error:      Optional[str]         = None
-    file_url:   Optional[str]         = None
     model_used: Optional[str]         = None
 
 # ═══════════════════════════════════════════════════════
@@ -282,7 +281,7 @@ async def extract_with_text(pdf_bytes: bytes, openai_client: AsyncOpenAI) -> tup
 # BUBBLE UPLOAD & APP FASTAPI
 # ═══════════════════════════════════════════════════════
 
-app = FastAPI(title="Invoice Extraction API", version="17.0.0 (Pure Extract)")
+app = FastAPI(title="Invoice Extraction API", version="17.2.0 (Pure Extract)")
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
 
 def get_openai_client() -> AsyncOpenAI:
@@ -290,43 +289,20 @@ def get_openai_client() -> AsyncOpenAI:
     if not key: raise RuntimeError("OPENAI_API_KEY manquant")
     return AsyncOpenAI(api_key=key)
 
-async def upload_pdf_to_bubble(pdf_bytes: bytes, filename: str) -> str:
-    bubble_token = os.getenv("BUBBLE_API_KEY", "")
-    bubble_base  = os.getenv("BUBBLE_BASE_URL", "https://www.portail-qualidal.com/version-test")
-    if not bubble_token: return ""
-    
-    upload_url = f"{bubble_base}/api/1.1/files/uploadprivate"
-    try:
-        async with httpx.AsyncClient(timeout=60) as client:
-            resp = await client.post(
-                upload_url,
-                headers={"Authorization": f"Bearer {bubble_token}"},
-                files={"file": (filename, pdf_bytes, "application/pdf")},
-            )
-            resp.raise_for_status()
-            return resp.json().get("fileUrl", "")
-    except Exception as e:
-        logger.warning(f"Upload Bubble échoué : {e}")
-        return ""
-
 @app.get("/health")
 async def health():
-    return {"status": "ok", "version": "17.0.0", "mode": "Pure Extract Hybrid"}
+    return {"status": "ok", "version": "17.2.0", "mode": "Pure Extract Hybrid"}
 
 @app.post("/extract", response_model=ExtractionResponse)
 async def extract_invoice(file: UploadFile = File(...)):
     try:
         pdf_bytes = await file.read()
-        filename  = file.filename or "devis.pdf"
         
-        # 1. Extraction des données (Texte d'abord, Vision si besoin)
+        # ⚡ Extraction pure des données (Texte d'abord, Vision si besoin)
         data, model_used = await extract_with_text(pdf_bytes, get_openai_client())
         
-        # 2. Upload sur Bubble
-        file_url = await upload_pdf_to_bubble(pdf_bytes, filename)
-        
         del pdf_bytes; gc.collect()
-        return ExtractionResponse(success=True, data=data, file_url=file_url, model_used=model_used)
+        return ExtractionResponse(success=True, data=data, model_used=model_used)
         
     except HTTPException as e:
         return ExtractionResponse(success=False, error=e.detail)

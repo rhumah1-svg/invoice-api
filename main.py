@@ -5,6 +5,7 @@ Invoice/Quote PDF Extraction API - V17.0 PURE EXTRACT (CORRIGÉE)
 - FOCUS UNIQUE : Extraction de données (Plus de /split).
 - VITESSE & PRÉCISION : Utilisation de `layout=True` pour pdfplumber.
 - CORRECTION BUGS : Prompt strict sur le formatage des nombres (4 000 -> 4000.0).
+- RETOURS À LA LIGNE : Préservation stricte des sauts de ligne (\n) dans les descriptions.
 - MODE HYBRIDE : Texte d'abord (gpt-4o-mini), Vision en secours.
 """
 
@@ -177,6 +178,7 @@ Un item valide = une ligne du tableau avec un P.U. HT ≠ 0 OU un Montant HT ≠
 
 - designation : Nom court (4-8 mots). Première ligne de l'item. Inclure le nom de la cellule si présent (ex: "Réparation - Cellule 1").
 - description : Tout le texte SOUS l'item, jusqu'au prochain item chiffré. Si aucun texte, mettre "". Ne jamais tronquer.
+  -> OBLIGATION ABSOLUE : Tu DOIS conserver les retours à la ligne exacts du devis d'origine en utilisant le caractère "\\n" dans la chaîne JSON. Ne condense JAMAIS le texte sur une seule ligne. Ceci est particulièrement important pour les listes à tirets ou à puces.
 - quantity : float.
 - unite : FORF, ML, M2, U, Heures, Jours, Semaine.
 - unit_price : float.
@@ -193,7 +195,7 @@ FORMAT DE SORTIE ATTENDU
 {
   "metadata": { "vendor_name": "...", "project_name": "...", "invoice_number": "devis_deXXXXXXXX", "date": "YYYY-MM-DD", "currency": "EUR" },
   "line_items": [
-    { "designation": "...", "description": "...", "quantity": 0.0, "unite": "...", "unit_price": 0.0 }
+    { "designation": "...", "description": "Ligne 1\\n- Tiret 1\\n- Tiret 2", "quantity": 0.0, "unite": "...", "unit_price": 0.0 }
   ],
   "totals": { "subtotal_ht": 0.0, "total_tax": 0.0, "total_ttc": 0.0 }
 }
@@ -255,7 +257,7 @@ async def extract_with_text(pdf_bytes: bytes, openai_client: AsyncOpenAI) -> tup
                 model=model, max_tokens=max_tok, temperature=0,
                 messages=[
                     {"role": "system", "content": SYSTEM_PROMPT},
-                    {"role": "user", "content": f"Texte du devis (formaté avec espaces) :\n\n{pdf_text}"}
+                    {"role": "user", "content": f"Texte du devis (formaté avec espaces et retours à la ligne) :\n\n{pdf_text}"}
                 ]
             )
             raw = resp.choices[0].message.content.strip()

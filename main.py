@@ -1,23 +1,20 @@
 """
-Invoice/Quote PDF Extraction API - V17.0 PURE EXTRACT
-=====================================================
-- FOCUS UNIQUE : Extraction de données (Plus de /split).
-- VITESSE & PRÉCISION : Utilisation de `layout=True` pour pdfplumber.
-- CORRECTION BUGS : Prompt strict sur le formatage des nombres (4 000 -> 4000.0).
-- MODE HYBRIDE : Texte d'abord (gpt-4o-mini), Vision en secours.
+Invoice/Quote PDF Extraction API - V19.0 HYBRID (Speed + Precision)
+===================================================================
+- STRUCTURED OUTPUTS : `client.beta.chat.completions.parse` (zéro erreur JSON)
+- SMART ROUTING : choose_model() score la complexité → mini ou 4o
+- VISION FALLBACK : Si texte extrait trop pauvre, envoie les pages en images
+- LECTURE RAPIDE : PyMuPDF par défaut, fallback pypdf
 """
 
 import os
 import io
-import logging
-import base64
 import re
-import gc
-import json
-import httpx
+import base64
+import logging
+import time
 from typing import Optional
 
-import pdfplumber
 from fastapi import FastAPI, UploadFile, File, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
@@ -27,55 +24,37 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 # ═══════════════════════════════════════════════════════
-# SÉLECTION DU MODÈLE (Pour la Vision en secours)
+# CONFIG
 # ═══════════════════════════════════════════════════════
 
-_AMO_KEYWORDS = [
-    "AMO", "phase exe", "phase exé", "OPR", "DOE", "CCTP", "EN15620",
-    "profilographe", "planéité", "réunion préparatoire", "dossier béton",
-    "contrôle qualité", "bureau de contrôle", "pièces marchés"
-]
+MODEL_FAST = os.getenv("OPENAI_MODEL_FAST", "gpt-4o-mini")
+MODEL_STRONG = os.getenv("OPENAI_MODEL_STRONG", "gpt-4o")
 
-def choose_model(pdf_bytes: bytes) -> str:
-    override = os.getenv("OPENAI_MODEL", "").strip()
-    if override in ("gpt-4o", "gpt-4o-mini"): return override
-
-    try:
-        full_text = ""
-        with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf:
-            for page in pdf.pages:
-                full_text += page.extract_text() or ""
-        
-        full_text_lower = full_text.lower()
-        keyword_hits = sum(1 for kw in _AMO_KEYWORDS if kw.lower() in full_text_lower)
-        
-        if len(full_text) > 4000 or keyword_hits >= 2:
-            return "gpt-4o"
-        return "gpt-4o-mini"
-    except Exception:
-        return "gpt-4o-mini"
+# Seuils pour choose_model()
+MIN_TEXT_LENGTH = 100          # En dessous → vision fallback
+COMPLEXITY_THRESHOLD = 60      # Score au-dessus → gpt-4o
 
 # ═══════════════════════════════════════════════════════
-# SCHEMAS PYDANTIC
+# SCHEMAS PYDANTIC (Structured Outputs)
 # ═══════════════════════════════════════════════════════
 
 class Metadata(BaseModel):
-    vendor_name:    str = Field(..., description="Nom de l'entreprise cliente")
-    project_name:   str = Field(..., description="Nom du projet / chantier")
-    invoice_number: str = Field(..., description="Référence devis_dexxxxxx")
-    date:           str = Field(..., description="Date YYYY-MM-DD")
-    currency:       str = Field(..., description="Code devise ISO")
+    vendor_name:    str = Field(..., description="Nom de l'entreprise CLIENTE (jamais Qualidal)")
+    project_name:   str = Field(..., description="Nom du projet / chantier (valeur après 'Chantier')")
+    invoice_number: str = Field(..., description="Référence stricte format 'devis_dexxxxxx' en minuscules")
+    date:           str = Field(..., description="Date du devis au format YYYY-MM-DD")
+    currency:       str = Field(default="EUR", description="Code devise ISO")
 
 class LineItem(BaseModel):
-    designation: str   = Field(..., description="Nom court du produit/service")
-    description: str   = Field(default="", description="Texte complet descriptif")
-    quantity:    float = Field(..., description="Quantité")
-    unite:       str   = Field(..., description="Unité (ML, M2, FORF, U, etc.)")
+    designation: str   = Field(..., description="Nom COURT du produit/service (pas la description technique)")
+    description: str   = Field(default="", description="Texte descriptif complet, conserver les retours à la ligne exacts")
+    quantity:    float = Field(..., description="Quantité (nombre exact)")
+    unite:       str   = Field(..., description="Unité exacte : ML, M2, FORF, U, H, J, SEM, ENS, etc.")
     unit_price:  float = Field(..., description="Prix unitaire HT")
 
 class Totals(BaseModel):
     subtotal_ht: float = Field(..., description="Total HT")
-    total_tax:   float = Field(..., description="TVA")
+    total_tax:   float = Field(..., description="TVA totale")
     total_ttc:   float = Field(..., description="Total TTC")
 
 class InvoiceData(BaseModel):
@@ -87,146 +66,350 @@ class ExtractionResponse(BaseModel):
     success:    bool
     data:       Optional[InvoiceData] = None
     error:      Optional[str]         = None
-    file_url:   Optional[str]         = None
     model_used: Optional[str]         = None
+    time_taken: Optional[str]         = None
+    method:     Optional[str]         = None  # "text" ou "vision"
 
 # ═══════════════════════════════════════════════════════
-# PDF → IMAGES (VISION FALLBACK)
+# LECTURE PDF
 # ═══════════════════════════════════════════════════════
 
-def pdf_bytes_to_images_b64(pdf_bytes: bytes, dpi: int = 150) -> list[str]:
+def extract_text_fast(pdf_bytes: bytes) -> str:
+    """Extrait le texte via PyMuPDF, fallback pypdf."""
+    t0 = time.time()
+    text = ""
+    
+    try:
+        import fitz  # PyMuPDF
+        doc = fitz.open(stream=pdf_bytes, filetype="pdf")
+        for page in doc:
+            text += page.get_text("text") + "\n"
+        doc.close()
+        logger.info(f"[CHRONO] Lecture PDF (PyMuPDF) : {time.time() - t0:.3f}s — {len(text)} chars")
+        return text.strip()
+    except ImportError:
+        logger.info("PyMuPDF non disponible, fallback pypdf...")
+    
+    try:
+        from pypdf import PdfReader
+        reader = PdfReader(io.BytesIO(pdf_bytes))
+        for page in reader.pages:
+            t = page.extract_text()
+            if t:
+                text += t + "\n"
+        logger.info(f"[CHRONO] Lecture PDF (pypdf) : {time.time() - t0:.3f}s — {len(text)} chars")
+    except Exception as e:
+        logger.warning(f"[text] Erreur lecture PDF: {e}")
+        
+    return text.strip()
+
+
+def pdf_to_images_base64(pdf_bytes: bytes, max_pages: int = 5) -> list[str]:
+    """Convertit les pages PDF en images base64 pour le mode vision."""
+    t0 = time.time()
+    images = []
+    
     try:
         import fitz
         doc = fitz.open(stream=pdf_bytes, filetype="pdf")
-        out = []
-        for page in doc:
-            mat = fitz.Matrix(dpi / 72, dpi / 72)
-            pix = page.get_pixmap(matrix=mat, alpha=False)
-            buf = io.BytesIO(pix.tobytes("jpeg", jpg_quality=75))
-            out.append(base64.b64encode(buf.getvalue()).decode())
+        for i, page in enumerate(doc):
+            if i >= max_pages:
+                break
+            # Render à 200 DPI pour un bon compromis qualité/taille
+            mat = fitz.Matrix(200/72, 200/72)
+            pix = page.get_pixmap(matrix=mat)
+            img_bytes = pix.tobytes("png")
+            b64 = base64.b64encode(img_bytes).decode("utf-8")
+            images.append(b64)
         doc.close()
-        return out
-    except ImportError:
-        pass
-    
-    try:
-        import pdf2image
-        images = pdf2image.convert_from_bytes(pdf_bytes, dpi=dpi, fmt="jpeg")
-        out = []
-        for img in images:
-            buf = io.BytesIO()
-            img.save(buf, format="JPEG", quality=75)
-            out.append(base64.b64encode(buf.getvalue()).decode())
-        return out
-    except ImportError:
-        raise RuntimeError("Aucune librairie de rendu PDF installée (pymupdf ou pdf2image).")
-
-# ═══════════════════════════════════════════════════════
-# EXTRACTION TEXTE (OPTIMISÉE AVEC LAYOUT=TRUE)
-# ═══════════════════════════════════════════════════════
-
-def extract_text_from_pdf(pdf_bytes: bytes) -> str:
-    """Extrait le texte en préservant l'espacement visuel des colonnes (crucial pour l'IA)."""
-    all_text = ""
-    try:
-        with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf:
-            for page in pdf.pages:
-                # layout=True simule les espaces entre les colonnes
-                all_text += (page.extract_text(layout=True) or "") + "\n"
+        logger.info(f"[CHRONO] PDF→Images ({len(images)} pages) : {time.time() - t0:.3f}s")
     except Exception as e:
-        logger.warning(f"[text] pdfplumber échoué: {e}")
-        return ""
-    return all_text.strip()
+        logger.error(f"[vision] Erreur conversion images: {e}")
+    
+    return images
 
 # ═══════════════════════════════════════════════════════
-# PROMPT TEXTE & VISION CONSOLIDÉS
+# SMART MODEL ROUTING
+# ═══════════════════════════════════════════════════════
+
+def choose_model(text: str) -> tuple[str, int]:
+    """
+    Score la complexité du texte extrait.
+    Retourne (model_name, score).
+    Score > COMPLEXITY_THRESHOLD → gpt-4o
+    """
+    score = 0
+    
+    # Nombre de lignes avec des montants (indicateur de lignes de devis)
+    amount_lines = len(re.findall(r'\d[\d\s]*[.,]\d{2}', text))
+    if amount_lines > 15:
+        score += 25  # Beaucoup de lignes = complexe
+    elif amount_lines > 8:
+        score += 10
+    
+    # Longueur du texte (proxy pour nombre de pages)
+    if len(text) > 5000:
+        score += 15
+    if len(text) > 10000:
+        score += 15
+    
+    # Présence de tableaux complexes (beaucoup de colonnes alignées)
+    tab_indicators = len(re.findall(r'\t', text))
+    if tab_indicators > 30:
+        score += 15
+    
+    # Sous-totaux multiples (structure hiérarchique)
+    subtotals = len(re.findall(r'(?i)sous[- ]?total|total\s+ht|total\s+lot', text))
+    if subtotals > 3:
+        score += 15
+    
+    # Texte avec beaucoup d'espaces mal parsés (colonnes mélangées)
+    double_spaces = len(re.findall(r'  {3,}', text))
+    if double_spaces > 20:
+        score += 20
+    
+    model = MODEL_STRONG if score >= COMPLEXITY_THRESHOLD else MODEL_FAST
+    logger.info(f"[ROUTING] Score={score} → {model} (amounts={amount_lines}, len={len(text)}, tabs={tab_indicators}, subtotals={subtotals})")
+    
+    return model, score
+
+# ═══════════════════════════════════════════════════════
+# PROMPT
 # ═══════════════════════════════════════════════════════
 
 SYSTEM_PROMPT = """\
 Tu es un expert en extraction de données de devis de travaux BTP français.
-Ces devis sont émis par QUALIDAL (13 avenue du Parc Alata, 60100 Creil).
-Retourne UNIQUEMENT un JSON valide, sans texte ni markdown autour.
+Ces devis sont émis par QUALIDAL (13 avenue du Parc Alata, 60100 CREIL).
 
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-RÈGLE ABSOLUE — NOMBRES ET FORMATS JSON (ANTI-CRASH)
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-Il est STRICTEMENT INTERDIT de mettre des espaces dans les nombres du JSON final.
-Sur le devis français, les milliers sont souvent séparés par un espace (ex: "4 000,00").
-Tu DOIS IMPÉRATIVEMENT :
-1. Supprimer TOUS les espaces.
-2. Remplacer la virgule par un point.
-Exemples obligatoires : 
-- "4 000,00" DOIT devenir 4000.0
-- "16 750,50" DOIT devenir 16750.5
-- "1 500" DOIT devenir 1500.0
-- "-130,00" DOIT devenir -130.0
-Si tu laisses un espace dans un nombre, le JSON sera invalide et le système plantera.
+══ RÈGLES NOMBRES (CRITIQUE) ══
+Les milliers ont souvent un espace (ex: "4 000,00").
+Tu DOIS :
+1. Supprimer TOUS les espaces dans les nombres.
+2. Remplacer la virgule décimale par un point.
+Exemples : "4 000,00" → 4000.0 | "16 750,50" → 16750.5 | "1 500" → 1500.0
 
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-RÈGLES METADATA
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-- vendor_name : L'entreprise CLIENTE (à qui est adressé le devis). Jamais Qualidal.
-- project_name : Colonne "Chantier".
-- invoice_number : Format OBLIGATOIRE "devis_de" + chiffres en minuscules (ex: devis_de00004001).
-- date : AAAA-MM-JJ
+══ RÈGLES METADATA ══
+- vendor_name : L'entreprise CLIENTE destinataire du devis (JAMAIS Qualidal). 
+  Chercher après "Monsieur/Madame" ou la ligne en majuscules après le bloc Qualidal.
+- project_name : La valeur du champ "Chantier" dans le tableau d'en-tête.
+  Couper avant toute date (JJ/MM/AAAA). Ne PAS inclure "de l'offre", "Date", "Condition".
+- invoice_number : Le numéro DExxxxxxxx → formaté "devis_de" + chiffres en minuscules.
+  Exemple : DE00004001 → "devis_de00004001"
+- date : La date du devis (pas la date de validité), format YYYY-MM-DD.
 
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-RÈGLES LINE ITEMS (PRESTATIONS)
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-Un item valide = une ligne du tableau avec un P.U. HT ≠ 0 OU un Montant HT ≠ 0.
-
-- designation : Nom court (4-8 mots). Première ligne de l'item. Inclure le nom de la cellule si présent (ex: "Réparation - Cellule 1").
-- description : Tout le texte SOUS l'item, jusqu'au prochain item chiffré. Si aucun texte, mettre "". Ne jamais tronquer.
-- quantity : float.
-- unite : FORF, ML, M2, U, Heures, Jours, Semaine.
-- unit_price : float.
+══ RÈGLES LIGNES (LINE_ITEMS) ══
+Un item valide = une ligne avec P.U. HT ≠ 0 OU Montant HT ≠ 0.
 
 NE PAS créer d'item pour :
-- Les lignes avec que des zéros
-- Les sous-totaux
-- Les titres de section sans prix
-- Les CGV (ex: "Travail le week-end", "Acompte", "Bon pour accord").
+- Les lignes à montant zéro (0,00)
+- Les sous-totaux ("Sous-total", "Total Lot", "Total HT")
+- Les titres de sections/lots (lignes sans prix)
+- Les CGV, mentions légales
+- Les lignes "Acompte", "Bon pour accord"
 
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-FORMAT DE SORTIE ATTENDU
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-{
-  "metadata": { "vendor_name": "...", "project_name": "...", "invoice_number": "devis_deXXXXXXXX", "date": "YYYY-MM-DD", "currency": "EUR" },
-  "line_items": [
-    { "designation": "...", "description": "...", "quantity": 0.0, "unite": "...", "unit_price": 0.0 }
-  ],
-  "totals": { "subtotal_ht": 0.0, "total_tax": 0.0, "total_ttc": 0.0 }
-}
+designation : Nom COURT du produit/service uniquement. 
+  PAS la description technique. Capitaliser chaque mot significatif.
+  Exemples : "Dallage Béton", "Réparation Fissures", "Joints De Dilatation"
+
+description : TOUT le texte descriptif sous l'item, avec les retours à la ligne exacts.
+
+unite : Utiliser l'unité EXACTE du devis (ML, M2, FORF, U, H, J, SEM, ENS).
+
+══ RÈGLES TOTAUX ══
+- subtotal_ht : Le montant "Total HT" ou "Montant HT" du devis.
+- total_tax : Le montant TVA.
+- total_ttc : Le montant TTC (= HT + TVA).
 """
 
 # ═══════════════════════════════════════════════════════
-# MOTEURS D'EXTRACTION
+# EXTRACTION ENGINE
 # ═══════════════════════════════════════════════════════
 
-async def extract_with_vision(pdf_bytes: bytes, openai_client: AsyncOpenAI) -> tuple[InvoiceData, str]:
-    import time
+async def extract_text_mode(pdf_text: str, model: str, client: AsyncOpenAI) -> tuple[InvoiceData, str]:
+    """Extraction via texte + Structured Outputs."""
     t0 = time.time()
-    try: images_b64 = pdf_bytes_to_images_b64(pdf_bytes, dpi=150)
-    except RuntimeError as e: raise HTTPException(status_code=500, detail=str(e))
+    
+    resp = await client.beta.chat.completions.parse(
+        model=model,
+        temperature=0,
+        messages=[
+            {"role": "system", "content": SYSTEM_PROMPT},
+            {"role": "user", "content": f"Voici le texte du devis :\n\n{pdf_text}"}
+        ],
+        response_format=InvoiceData
+    )
+    
+    data = resp.choices[0].message.parsed
+    elapsed = time.time() - t0
+    logger.info(f"[CHRONO] IA text mode ({model}) : {elapsed:.3f}s — {len(data.line_items)} items extraits")
+    return data, f"{model} (structured/text)"
 
-    model = choose_model(pdf_bytes)
-    content = [{"type": "text", "text": "Extrait TOUS les items avec P.U. HT ≠ 0. Retourne UNIQUEMENT le JSON."}]
-    for img in images_b64:
-        content.append({"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{img}", "detail": "high"}})
 
-    last_error = None
-    for attempt in range(1, 3):
-        try:
-            resp = await openai_client.chat.completions.create(
-                model=model, max_tokens=8000, temperature=0,
-                messages=[{"role": "system", "content": SYSTEM_PROMPT}, {"role": "user", "content": content}]
-            )
-            raw = resp.choices[0].message.content.strip()
-            raw = re.sub(r'^
-http://googleusercontent.com/immersive_entry_chip/0
-http://googleusercontent.com/immersive_entry_chip/1
+async def extract_vision_mode(pdf_bytes: bytes, model: str, client: AsyncOpenAI) -> tuple[InvoiceData, str]:
+    """Extraction via images des pages PDF (fallback quand le texte est mauvais)."""
+    t0 = time.time()
+    
+    images_b64 = pdf_to_images_base64(pdf_bytes, max_pages=5)
+    if not images_b64:
+        raise HTTPException(status_code=500, detail="Impossible de convertir le PDF en images")
+    
+    # Construire le message avec images
+    content = [{"type": "text", "text": "Voici les pages du devis en images. Extrais toutes les données."}]
+    for b64 in images_b64:
+        content.append({
+            "type": "image_url",
+            "image_url": {"url": f"data:image/png;base64,{b64}", "detail": "high"}
+        })
+    
+    # Note : .parse() avec vision fonctionne sur gpt-4o mais PAS sur gpt-4o-mini
+    # On force gpt-4o pour le mode vision
+    vision_model = MODEL_STRONG
+    
+    resp = await client.beta.chat.completions.parse(
+        model=vision_model,
+        temperature=0,
+        messages=[
+            {"role": "system", "content": SYSTEM_PROMPT},
+            {"role": "user", "content": content}
+        ],
+        response_format=InvoiceData
+    )
+    
+    data = resp.choices[0].message.parsed
+    elapsed = time.time() - t0
+    logger.info(f"[CHRONO] IA vision mode ({vision_model}) : {elapsed:.3f}s — {len(data.line_items)} items extraits")
+    return data, f"{vision_model} (structured/vision)"
 
-### Pourquoi cette version va tout changer pour toi :
-1. **La vitesse** : On ne boucle plus sur des "parties". Le fichier arrive, on lit le texte, on l'envoie à OpenAI, terminé. 
-2. **La robustesse `layout=True`** : Quand OpenAI recevait le texte avant, il voyait : `Nettoyage 150 15 2250`. Maintenant, il verra : `Nettoyage                 150      15       2250`. Il comprendra visuellement où sont les colonnes.
-3. **Moins de lignes de code = Moins de bugs potentiels.** Tu peux tester ça directement avec ton fichier `start.bat`. Dis-moi si tu constates une amélioration sur le fameux problème des espaces dans les milliers !
+
+async def extract_smart(pdf_bytes: bytes, client: AsyncOpenAI) -> tuple[InvoiceData, str, str]:
+    """
+    Pipeline intelligent :
+    1. Extraire texte (rapide)
+    2. Si texte trop court → vision fallback
+    3. Sinon → choose_model() → text mode
+    4. Validation basique → si suspect, retry vision
+    """
+    # Étape 1 : Extraction texte
+    pdf_text = extract_text_fast(pdf_bytes)
+    
+    # Étape 2 : Texte trop court ? → Vision directe
+    if len(pdf_text) < MIN_TEXT_LENGTH:
+        logger.info(f"[ROUTING] Texte trop court ({len(pdf_text)} chars) → vision fallback")
+        data, model_info = await extract_vision_mode(pdf_bytes, MODEL_STRONG, client)
+        return data, model_info, "vision"
+    
+    # Étape 3 : Choisir le modèle selon la complexité
+    model, score = choose_model(pdf_text)
+    
+    try:
+        data, model_info = await extract_text_mode(pdf_text, model, client)
+        
+        # Étape 4 : Validation basique
+        issues = validate_extraction(data, pdf_text)
+        
+        if issues and model == MODEL_FAST:
+            # Problème détecté avec mini → retry avec gpt-4o
+            logger.info(f"[VALIDATION] Problèmes détectés avec {MODEL_FAST}: {issues} → retry {MODEL_STRONG}")
+            data, model_info = await extract_text_mode(pdf_text, MODEL_STRONG, client)
+            issues2 = validate_extraction(data, pdf_text)
+            
+            if issues2:
+                # Toujours des problèmes → dernier recours : vision
+                logger.info(f"[VALIDATION] Toujours des problèmes → vision fallback")
+                data, model_info = await extract_vision_mode(pdf_bytes, MODEL_STRONG, client)
+                return data, model_info, "vision (auto-fallback)"
+            
+            return data, model_info, "text (retry)"
+        
+        return data, model_info, "text"
+        
+    except Exception as e:
+        logger.warning(f"[FALLBACK] Erreur text mode: {e} → vision fallback")
+        data, model_info = await extract_vision_mode(pdf_bytes, MODEL_STRONG, client)
+        return data, model_info, "vision (error-fallback)"
+
+
+def validate_extraction(data: InvoiceData, pdf_text: str) -> list[str]:
+    """
+    Vérifie la cohérence de l'extraction.
+    Retourne une liste de problèmes détectés (vide = OK).
+    """
+    issues = []
+    
+    # 1. Aucun item extrait alors que le texte contient des montants
+    amount_matches = re.findall(r'\d[\d\s]*[.,]\d{2}', pdf_text)
+    if len(data.line_items) == 0 and len(amount_matches) > 3:
+        issues.append(f"0 items extraits mais {len(amount_matches)} montants dans le texte")
+    
+    # 2. vendor_name = Qualidal (erreur fréquente)
+    if data.metadata.vendor_name and 'qualidal' in data.metadata.vendor_name.lower():
+        issues.append("vendor_name contient 'Qualidal' (devrait être le client)")
+    
+    # 3. invoice_number mal formaté
+    if data.metadata.invoice_number and not re.match(r'^devis_de\d+$', data.metadata.invoice_number):
+        issues.append(f"invoice_number mal formaté: {data.metadata.invoice_number}")
+    
+    # 4. Total HT = 0 alors qu'il y a des items
+    if len(data.line_items) > 0 and data.totals.subtotal_ht == 0:
+        issues.append("Total HT = 0 avec des items présents")
+    
+    # 5. Somme des items très différente du total déclaré (>10% d'écart)
+    if data.totals.subtotal_ht > 0 and len(data.line_items) > 0:
+        items_sum = sum(item.quantity * item.unit_price for item in data.line_items)
+        if items_sum > 0:
+            ecart = abs(items_sum - data.totals.subtotal_ht) / data.totals.subtotal_ht
+            if ecart > 0.10:
+                issues.append(f"Écart {ecart:.0%} entre somme items ({items_sum:.2f}) et total HT ({data.totals.subtotal_ht:.2f})")
+    
+    if issues:
+        logger.warning(f"[VALIDATION] Problèmes: {issues}")
+    
+    return issues
+
+# ═══════════════════════════════════════════════════════
+# APP FASTAPI
+# ═══════════════════════════════════════════════════════
+
+app = FastAPI(title="Invoice Extraction API", version="19.0.0 (Hybrid)")
+app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
+
+def get_openai_client() -> AsyncOpenAI:
+    key = os.getenv("OPENAI_API_KEY")
+    if not key:
+        raise RuntimeError("OPENAI_API_KEY manquant")
+    return AsyncOpenAI(api_key=key)
+
+@app.get("/health")
+async def health():
+    return {
+        "status": "ok",
+        "version": "19.0.0",
+        "mode": "Hybrid (Speed + Precision)",
+        "model_fast": MODEL_FAST,
+        "model_strong": MODEL_STRONG
+    }
+
+@app.post("/extract", response_model=ExtractionResponse)
+async def extract_invoice(file: UploadFile = File(...)):
+    t_start = time.time()
+    try:
+        pdf_bytes = await file.read()
+        
+        data, model_used, method = await extract_smart(pdf_bytes, get_openai_client())
+        
+        total_time = f"{time.time() - t_start:.2f}s"
+        logger.info(f"[CHRONO] TOTAL {file.filename} : {total_time} — méthode: {method}")
+        
+        return ExtractionResponse(
+            success=True,
+            data=data,
+            model_used=model_used,
+            time_taken=total_time,
+            method=method
+        )
+        
+    except HTTPException as e:
+        return ExtractionResponse(success=False, error=e.detail)
+    except Exception as e:
+        logger.exception("Error /extract")
+        return ExtractionResponse(success=False, error=str(e))

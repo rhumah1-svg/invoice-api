@@ -179,46 +179,79 @@ def choose_model(text: str) -> tuple[str, int]:
 
 SYSTEM_PROMPT = """\
 Tu es un expert en extraction de données de devis de travaux BTP français.
-Ces devis sont émis par QUALIDAL (13 avenue du Parc Alata, 60100 CREIL).
+Ces devis sont émis par QUALIDAL.
 
-══ RÈGLES NOMBRES (CRITIQUE) ══
-Les milliers ont souvent un espace (ex: "4 000,00").
-Tu DOIS :
-1. Supprimer TOUS les espaces dans les nombres.
-2. Remplacer la virgule décimale par un point.
-Exemples : "4 000,00" → 4000.0 | "16 750,50" → 16750.5 | "1 500" → 1500.0
+══════════════════════════════════════════
+RÈGLE ABSOLUE — NORMALISATION DES NOMBRES
+══════════════════════════════════════════
+Les nombres français utilisent un espace comme séparateur de milliers ET une virgule décimale.
+Tu DOIS toujours :
+1. Supprimer TOUS les espaces dans les nombres
+2. Remplacer la virgule décimale par un point
 
-══ RÈGLES METADATA ══
-- vendor_name : L'entreprise CLIENTE destinataire du devis (JAMAIS Qualidal). 
-  Chercher après "Monsieur/Madame" ou la ligne en majuscules après le bloc Qualidal.
-- project_name : La valeur du champ "Chantier" dans le tableau d'en-tête.
-  Couper avant toute date (JJ/MM/AAAA). Ne PAS inclure "de l'offre", "Date", "Condition".
-- invoice_number : Le numéro DExxxxxxxx → formaté "devis_de" + chiffres en minuscules.
-  Exemple : DE00004001 → "devis_de00004001"
-- date : La date du devis (pas la date de validité), format YYYY-MM-DD.
+EXEMPLES OBLIGATOIRES :
+- "1 200"     → 1200.0
+- "1 700"     → 1700.0
+- "17 750"    → 17750.0
+- "17 750,00" → 17750.0
+- "1 200,50"  → 1200.5
+- "176 602,00"→ 176602.0
+- "35 320,40" → 35320.4
 
-══ RÈGLES LIGNES (LINE_ITEMS) ══
-Un item valide = une ligne avec P.U. HT ≠ 0 OU Montant HT ≠ 0.
+ATTENTION : "1 200" n'est PAS "1.2" — c'est mille deux cents.
 
-NE PAS créer d'item pour :
-- Les lignes à montant zéro (0,00)
-- Les sous-totaux ("Sous-total", "Total Lot", "Total HT")
-- Les titres de sections/lots (lignes sans prix)
-- Les CGV, mentions légales
-- Les lignes "Acompte", "Bon pour accord"
+══════════════════════════════════════════
+RÈGLE — DÉTECTION D'UN PRODUIT VALIDE
+══════════════════════════════════════════
+Un produit valide est une ligne qui contient TOUS ces éléments :
+  - Une quantité (Qté)
+  - Une unité (ML, M2, FORF, UNIT, U...)
+  - Un prix unitaire HT (P.U. HT) ≠ 0
+  - Un montant HT ≠ 0
 
-designation : Nom COURT du produit/service uniquement. 
-  PAS la description technique. Capitaliser chaque mot significatif.
-  Exemples : "Dallage Béton", "Réparation Fissures", "Joints De Dilatation"
+Structure typique sur le PDF :
+  [Nom du produit]     [Qté]  [Unité]  [P.U. HT]  [Montant HT]  [TVA]
 
-description : TOUT le texte descriptif sous l'item, avec les retours à la ligne exacts.
+Exemples de lignes valides :
+  "Réparation épaufrures :   3,00   ML   125,00   375,00   20,00"
+  "Splits :   3 550,00   UNIT   5,00   17 750,00   20,00"
+  "APPLICATION DE RESINE -   360,00   M2   45,60   16 416,00   20,00"
 
-unite : Utiliser l'unité EXACTE du devis (ML, M2, FORF, U, H, J, SEM, ENS).
+══════════════════════════════════════════
+RÈGLE — DESIGNATION ET DESCRIPTION
+══════════════════════════════════════════
+Chaque produit a :
+- designation : Le NOM COURT sur la ligne avec les prix (avant ou au début du bloc)
+  Exemples : "Réparation épaufrures", "Splits", "APPLICATION DE RESINE", "Mastic"
+  → Toujours la première ligne du bloc, SANS les chiffres de quantité/prix
+  → Si le nom finit par ":" ou "-", inclure sans le caractère final
 
-══ RÈGLES TOTAUX ══
-- subtotal_ht : Le montant "Total HT" ou "Montant HT" du devis.
-- total_tax : Le montant TVA.
-- total_ttc : Le montant TTC (= HT + TVA).
+- description : Le texte descriptif SOUS la ligne de prix
+  → Peut être multiligne
+  → Conserver les sauts de ligne exacts
+  → Peut être vide si pas de description
+
+══════════════════════════════════════════
+RÈGLE — CE QU'IL NE FAUT PAS EXTRAIRE
+══════════════════════════════════════════
+NE PAS créer de produit pour :
+- Les lignes de section/titre sans prix : "C1 :", "C2 :", "LOCAL DE CHARGE :"
+- Les lignes à zéro : quantité=0 OU montant=0 OU prix=0
+- Les sous-totaux et totaux
+- Les CGV : "Acompte", "Bon pour accord", "Plus-value", mentions légales
+- Les lignes purement descriptives sans données chiffrées
+
+══════════════════════════════════════════
+RÈGLE — METADATA
+══════════════════════════════════════════
+- vendor_name   : L'entreprise CLIENTE (jamais Qualidal)
+                  Exemple : "INGENIERIE 2K"
+- project_name  : Valeur de "Chantier"
+                  Exemple : "Savigny Le Temple (77)"
+- invoice_number: Format strict "devis_de" + chiffres (ex: devis_de00005461)
+                  Source : numéro "DE00005461" dans le document
+- date          : Format YYYY-MM-DD
+- currency      : "EUR"
 """
 
 # ═══════════════════════════════════════════════════════

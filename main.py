@@ -1,13 +1,13 @@
 """
-Invoice/Quote PDF Extraction API - V16.1 HYBRID (Extract Only)
+Invoice/Quote PDF Extraction API - V16.2 HYBRID (Extract Only)
 ===============================================================
-Mode HYBRIDE : pdfplumber extrait le TEXTE du PDF, envoyé à gpt-4o-mini.
+Mode HYBRIDE : pdfplumber extrait le TEXTE du PDF, envoyé à gpt-5.4-mini.
 Plus besoin d'images → 5-8s au lieu de 30-40s, coût /10.
 
   - extract_with_text() : fonction principale (texte pdfplumber → LLM)
   - extract_with_vision() : conservée en FALLBACK si pdfplumber échoue
-  - choose_model() conservé pour le fallback vision uniquement
   - Endpoints : /health + /extract uniquement
+  - Modèle unique : gpt-5.4-mini (override possible via OPENAI_MODEL env)
 """
 
 import os, io, logging, base64, re, gc, json, time
@@ -23,109 +23,16 @@ from openai import AsyncOpenAI
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-
-# ═══════════════════════════════════════════════════════
-# SÉLECTION DU MODÈLE  — V15 : + densité descriptive
-# ═══════════════════════════════════════════════════════
-
-_AMO_KEYWORDS = [
-    "AMO", "phase exe", "phase exé", "OPR", "DOE", "CCTP", "EN15620",
-    "profilographe", "planéité", "réunion préparatoire", "dossier béton",
-    "contrôle qualité", "bureau de contrôle", "pièces marchés",
-    "prédimensionnement", "pré-dimensionnement", "étude préliminaire",
-    "analyse des offres", "rapport journalier", "visite après coulage",
-    "analyse CCTP",
-]
+DEFAULT_MODEL = "gpt-5.4-mini"
 
 
-def choose_model(pdf_bytes: bytes) -> str:
-    """
-    V15 : sélection intelligente avec 6 critères (score sur 10).
-    Nouveau critère : densité descriptive (lignes de texte entre lignes de prix).
-    """
+def get_model() -> str:
+    """Retourne le modèle à utiliser. Override possible via env OPENAI_MODEL."""
     override = os.getenv("OPENAI_MODEL", "").strip()
-    if override in ("gpt-4o", "gpt-4o-mini"):
-        logger.info(f"[choose_model] override env → {override}")
+    if override:
+        logger.info(f"[model] override env → {override}")
         return override
-
-    try:
-        full_text = ""
-        total_chars = 0
-        total_lines = 0
-        lines_with_prices = 0
-        text_lines_between_prices = []
-        current_gap = 0
-
-        with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf:
-            n_pages = len(pdf.pages)
-            for page in pdf.pages:
-                text = page.extract_text() or ""
-                full_text += text
-                lines = [l.strip() for l in text.split("\n") if l.strip()]
-                total_lines += len(lines)
-
-                for line in lines:
-                    total_chars += len(line)
-                    if re.search(r'\d[\d\s]{2,},\d{2}', line):
-                        lines_with_prices += 1
-                        if current_gap > 0:
-                            text_lines_between_prices.append(current_gap)
-                        current_gap = 0
-                    else:
-                        current_gap += 1
-
-        ratio_texte_prix = total_chars / max(lines_with_prices, 1)
-        avg_line_length = total_chars / max(total_lines, 1)
-        avg_desc_density = (
-            sum(text_lines_between_prices) / len(text_lines_between_prices)
-            if text_lines_between_prices else 0
-        )
-        max_desc_gap = max(text_lines_between_prices) if text_lines_between_prices else 0
-
-        full_text_lower = full_text.lower()
-        keyword_hits = sum(1 for kw in _AMO_KEYWORDS if kw.lower() in full_text_lower)
-
-        score = 0
-        reasons = []
-
-        if n_pages >= 3:
-            score += 2
-            reasons.append(f"nb_pages={n_pages}>=3 (+2)")
-        if ratio_texte_prix > 1500:
-            score += 2
-            reasons.append(f"ratio_texte_prix={ratio_texte_prix:.0f}>1500 (+2)")
-        if avg_line_length > 60:
-            score += 1
-            reasons.append(f"avg_line_length={avg_line_length:.0f}>60 (+1)")
-        if keyword_hits >= 2:
-            score += 2
-            reasons.append(f"keyword_hits={keyword_hits}>=2 (+2)")
-        elif keyword_hits == 1:
-            score += 1
-            reasons.append(f"keyword_hits={keyword_hits}=1 (+1)")
-        if lines_with_prices <= 4 and total_chars > 2000:
-            score += 1
-            reasons.append(f"peu_de_prix={lines_with_prices}<=4 (+1)")
-        if avg_desc_density >= 3:
-            score += 2
-            reasons.append(f"avg_desc_density={avg_desc_density:.1f}>=3 (+2)")
-        elif max_desc_gap >= 5:
-            score += 1
-            reasons.append(f"max_desc_gap={max_desc_gap}>=5 (+1)")
-
-        model = "gpt-4o" if score >= 2 else "gpt-4o-mini"
-
-        logger.info(
-            f"[choose_model] score={score}/10 → {model} | "
-            f"pages={n_pages} lines_prix={lines_with_prices} "
-            f"avg_desc_density={avg_desc_density:.1f} max_gap={max_desc_gap} | "
-            f"raisons: {' | '.join(reasons) if reasons else 'devis standard'}"
-        )
-        return model
-
-    except Exception as e:
-        logger.warning(f"[choose_model] erreur analyse PDF → fallback gpt-4o-mini : {e}")
-        return "gpt-4o-mini"
+    return DEFAULT_MODEL
 
 
 # ═══════════════════════════════════════════════════════
@@ -378,7 +285,7 @@ FORMAT DE SORTIE — JSON STRICT
 
 
 # ═══════════════════════════════════════════════════════
-# EXTRACTION HYBRIDE — V16 : texte d'abord, vision en fallback
+# EXTRACTION HYBRIDE — V16.2 : gpt-5.4-mini partout
 # ═══════════════════════════════════════════════════════
 
 async def extract_with_text(
@@ -386,7 +293,7 @@ async def extract_with_text(
     openai_client: AsyncOpenAI
 ) -> tuple[InvoiceData, str]:
     """
-    V16 HYBRIDE : extrait le texte via pdfplumber puis l'envoie à gpt-4o-mini.
+    V16.2 HYBRIDE : extrait le texte via pdfplumber puis l'envoie à gpt-5.4-mini.
     Fallback sur extract_with_vision si pdfplumber échoue.
     """
     t0 = time.time()
@@ -401,15 +308,7 @@ async def extract_with_text(
         logger.warning("[text] Texte trop court, fallback vision")
         return await extract_with_vision(pdf_bytes, openai_client)
 
-    # Étape 2 : choisir le modèle selon la complexité du devis
-    override = os.getenv("OPENAI_MODEL", "").strip()
-    if override in ("gpt-4o", "gpt-4o-mini"):
-        model = override
-    else:
-        if len(pdf_text) > 5000:
-            model = "gpt-4o"
-        else:
-            model = "gpt-4o-mini"
+    model = get_model()
 
     # max_tokens adaptatif : gros devis → plus de place pour la réponse
     max_tok = 8000 if len(pdf_text) > 5000 else 4000
@@ -805,7 +704,7 @@ FORMAT DE SORTIE — JSON STRICT, SANS MARKDOWN
 
 
 # ═══════════════════════════════════════════════════════
-# EXTRACTION VISION  — V15 avec choose_model (fallback)
+# EXTRACTION VISION  — fallback si pdfplumber échoue
 # ═══════════════════════════════════════════════════════
 
 async def extract_with_vision(
@@ -814,7 +713,7 @@ async def extract_with_vision(
 ) -> tuple[InvoiceData, str]:
     """
     Retourne (InvoiceData, model_used).
-    V15 : sélection automatique du modèle + optimisations perf (DPI 150, JPEG 75).
+    Fallback vision : convertit le PDF en images puis envoie à gpt-5.4-mini.
     """
     t0 = time.time()
 
@@ -828,9 +727,8 @@ async def extract_with_vision(
     img_sizes_kb = [len(b) * 3 / 4 / 1024 for b in images_b64]
     logger.info(f"[perf] PDF→images: {t1-t0:.1f}s | {n_pages} page(s) | {sum(img_sizes_kb):.0f} KB total")
 
-    model = choose_model(pdf_bytes)
-    t2 = time.time()
-    logger.info(f"[perf] choose_model: {t2-t1:.1f}s → {model}")
+    model = get_model()
+    logger.info(f"[vision] fallback vision → {model}")
 
     content = [{
         "type": "text",
@@ -890,15 +788,15 @@ async def extract_with_vision(
         data["metadata"]["invoice_number"] = f"devis_de{m.group(1).zfill(8)}"
 
     n_items = len(data.get("line_items", []))
-    t3 = time.time()
-    logger.info(f"[perf] OpenAI API: {t3-t2:.1f}s | {model} | {n_items} item(s)")
-    logger.info(f"[perf] TOTAL extract_with_vision: {t3-t0:.1f}s")
+    t2 = time.time()
+    logger.info(f"[perf] OpenAI API: {t2-t1:.1f}s | {model} | {n_items} item(s)")
+    logger.info(f"[perf] TOTAL extract_with_vision: {t2-t0:.1f}s")
     logger.info(f"[vision] ✓ {model} — {n_items} item(s) extraits")
     if n_items == 0:
         logger.warning("[vision] ⚠ AUCUN item extrait — vérifier le PDF")
 
     try:
-        return InvoiceData(**data), model
+        return InvoiceData(**data), f"{model} (vision)"
     except Exception as e:
         logger.error(f"[vision] Pydantic: {e}")
         raise HTTPException(status_code=500, detail=f"Structure IA invalide: {e}")
@@ -908,7 +806,7 @@ async def extract_with_vision(
 # APP & ROUTES
 # ═══════════════════════════════════════════════════════
 
-app = FastAPI(title="Invoice Extraction API", version="16.1.0")
+app = FastAPI(title="Invoice Extraction API", version="16.2.0")
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
 
 def get_openai_client() -> AsyncOpenAI:
@@ -947,10 +845,10 @@ async def upload_pdf_to_bubble(pdf_bytes: bytes, filename: str) -> str:
 async def health():
     return {
         "status": "ok",
-        "version": "16.1.0",
+        "version": "16.2.0",
         "mode": "hybrid (text first, vision fallback)",
-        "model_default": "gpt-4o-mini (text mode)",
-        "model_override": os.getenv("OPENAI_MODEL", "non défini — gpt-4o-mini par défaut"),
+        "model_default": DEFAULT_MODEL,
+        "model_override": os.getenv("OPENAI_MODEL", "non défini — gpt-5.4-mini par défaut"),
     }
 
 

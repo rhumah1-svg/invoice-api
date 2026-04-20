@@ -319,7 +319,7 @@ async def extract_with_text(
         try:
             resp = await openai_client.chat.completions.create(
                 model=model,
-                max_completion_tokens=max_tok,,
+                max_completion_tokens=max_tok,
                 temperature=0,
                 messages=[
                     {"role": "system", "content": SYSTEM_PROMPT_TEXT},

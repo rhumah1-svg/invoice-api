@@ -866,3 +866,154 @@ async def extract_invoice(file: UploadFile = File(...)):
     except Exception as e:
         logger.exception("Error /extract")
         return ExtractionResponse(success=False, error=str(e))
+
+# ═══════════════════════════════════════════════════════
+# AJOUT — /extract-meta (métadonnées uniquement, pas d'items)
+# À AJOUTER À LA FIN DU FICHIER main.py, AVANT rien
+# NE MODIFIE RIEN de l'existant
+# ═══════════════════════════════════════════════════════
+
+
+# --- Schema métadonnées uniquement ---
+
+class MetadataExtract(BaseModel):
+    vendor_name:    str   = Field(..., description="Nom de l'entreprise cliente (pas Qualidal)")
+    project_name:   str   = Field(..., description="Nom du projet / chantier")
+    invoice_number: str   = Field(..., description="Référence devis_deXXXXXXXX")
+    date:           str   = Field(..., description="Date YYYY-MM-DD")
+    total_ht:       float = Field(..., description="Montant total HT")
+
+class MetaExtractionResponse(BaseModel):
+    success:    bool
+    data:       Optional[MetadataExtract] = None
+    file_url:   str = ""
+    model_used: str = ""
+    error:      Optional[str] = None
+
+
+# --- Prompt simplifié (métadonnées + total HT seulement) ---
+
+SYSTEM_PROMPT_META = """\
+Tu es un expert en extraction de métadonnées de devis de travaux BTP français.
+Ces devis sont émis par QUALIDAL (13 avenue du Parc Alata, 60100 Creil).
+Tu reçois le TEXTE BRUT extrait d'un PDF de devis.
+Retourne UNIQUEMENT un JSON valide, sans texte ni markdown autour.
+
+Tu dois extraire UNIQUEMENT ces 5 champs :
+
+1. vendor_name — Entreprise CLIENTE (pas Qualidal). Chercher après "Monsieur/Madame" → ligne suivante.
+2. project_name — Valeur de la ligne "Chantier" dans le tableau récapitulatif. Si courte, compléter avec "Adresse du chantier".
+3. invoice_number — Chercher "DE" + 4-10 chiffres → format "devis_de" + 8 chiffres min. Ex: DE00005612 → "devis_de00005612"
+4. date — Colonne "Date" du tableau récapitulatif → AAAA-MM-JJ. Si absente : ""
+5. total_ht — Ligne "Total HT" du devis. Espaces = séparateurs de milliers : "1 700" = 1700.0, "156 878,00" = 156878.0
+
+NE PAS extraire les lignes d'items ni les totaux TVA/TTC.
+
+FORMAT DE SORTIE :
+{
+  "vendor_name": "...",
+  "project_name": "...",
+  "invoice_number": "devis_deXXXXXXXX",
+  "date": "YYYY-MM-DD",
+  "total_ht": 0.0
+}"""
+
+
+# --- Fonction d'extraction métadonnées ---
+
+async def extract_meta_from_text(
+    pdf_bytes: bytes,
+    openai_client: AsyncOpenAI
+) -> tuple[MetadataExtract, str]:
+    """
+    Extrait uniquement les métadonnées + total HT via pdfplumber + LLM.
+    Beaucoup plus rapide et moins cher que /extract.
+    """
+    t0 = time.time()
+
+    # 1. Extraction texte (pdfplumber)
+    all_text = ""
+    try:
+        with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf:
+            # On ne prend que les 2 premières pages (métadonnées + total HT sont toujours là)
+            for page in pdf.pages[:2]:
+                all_text += (page.extract_text() or "") + "\n"
+    except Exception as e:
+        logger.warning(f"[extract-meta] pdfplumber échoué: {e}")
+        raise HTTPException(status_code=500, detail=f"Impossible de lire le PDF: {e}")
+
+    all_text = all_text.strip()
+    if len(all_text) < 50:
+        raise HTTPException(status_code=400, detail="PDF trop court ou illisible (texte < 50 car.)")
+
+    # 2. Appel LLM (métadonnées uniquement)
+    model = get_model()
+    t1 = time.time()
+
+    last_error = None
+    for attempt in range(1, 3):
+        try:
+            resp = await openai_client.chat.completions.create(
+                model=model,
+                max_completion_tokens=500,   # Beaucoup moins que /extract (8000)
+                temperature=0,
+                messages=[
+                    {"role": "system", "content": SYSTEM_PROMPT_META},
+                    {"role": "user",   "content": f"Voici le texte du devis :\n\n{all_text[:4000]}"}
+                ]
+            )
+        except Exception as e:
+            logger.exception(f"[extract-meta] Erreur OpenAI tentative {attempt}")
+            last_error = e
+            continue
+
+        raw = resp.choices[0].message.content.strip()
+        raw = re.sub(r'^```(?:json)?\s*', '', raw, flags=re.MULTILINE)
+        raw = re.sub(r'\s*```$',          '', raw, flags=re.MULTILINE).strip()
+
+        try:
+            data = json.loads(raw)
+            break
+        except json.JSONDecodeError as e:
+            logger.error(f"[extract-meta] Tentative {attempt} JSON invalide: {e}\n{raw[:300]}")
+            last_error = e
+            continue
+    else:
+        raise HTTPException(status_code=500, detail=f"Extraction meta échouée après 2 tentatives: {last_error}")
+
+    # 3. Sécurité invoice_number
+    inv = data.get("invoice_number", "")
+    m = re.search(r'DE(\d{4,10})', inv, re.IGNORECASE)
+    if m:
+        data["invoice_number"] = f"devis_de{m.group(1).zfill(8)}"
+
+    t2 = time.time()
+    logger.info(f"[extract-meta] ✓ {model} en {t2-t0:.1f}s — {data.get('vendor_name','')} / {data.get('invoice_number','')}")
+
+    try:
+        return MetadataExtract(**data), f"{model} (meta)"
+    except Exception as e:
+        logger.error(f"[extract-meta] Pydantic: {e}")
+        raise HTTPException(status_code=500, detail=f"Structure invalide: {e}")
+
+
+# --- Endpoint ---
+
+@app.post("/extract-meta", response_model=MetaExtractionResponse)
+async def extract_meta(file: UploadFile = File(...)):
+    """
+    Extraction métadonnées uniquement (pas d'items).
+    Plus rapide, moins cher. Pour le tableau de gestion devis.
+    """
+    try:
+        pdf_bytes = await file.read()
+        filename  = file.filename or "devis.pdf"
+        data, model_used = await extract_meta_from_text(pdf_bytes, get_openai_client())
+        file_url  = await upload_pdf_to_bubble(pdf_bytes, filename)
+        del pdf_bytes; gc.collect()
+        return MetaExtractionResponse(success=True, data=data, file_url=file_url, model_used=model_used)
+    except HTTPException as e:
+        return MetaExtractionResponse(success=False, error=e.detail)
+    except Exception as e:
+        logger.exception("Error /extract-meta")
+        return MetaExtractionResponse(success=False, error=str(e))

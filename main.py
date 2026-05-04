@@ -1,12 +1,21 @@
 """
-Invoice/Quote PDF Extraction API - V16.2 HYBRID (Extract Only)
-===============================================================
+Invoice/Quote PDF Extraction API - V16.3 HYBRID + Ref Cde regex
+================================================================
 Mode HYBRIDE : pdfplumber extrait le TEXTE du PDF, envoyé à gpt-5.4-mini.
 Plus besoin d'images → 5-8s au lieu de 30-40s, coût /10.
 
+Changelog V16.3 :
+  - Ajout extract_ref_cde() : regex deterministe (pas d'IA) pour récupérer
+    la "Ref Cde" présente sur tous les devis Qualidal.
+  - Schema Metadata enrichi avec champ ref_cde (Optional).
+  - Injection ref_cde après parsing JSON OpenAI dans extract_with_text() et
+    extract_with_vision().
+  - Endpoint /extract-meta inchangé côté contrat — ref_cde apparait dans
+    data.metadata.ref_cde si trouvée, sinon null.
+
   - extract_with_text() : fonction principale (texte pdfplumber → LLM)
   - extract_with_vision() : conservée en FALLBACK si pdfplumber échoue
-  - Endpoints : /health + /extract uniquement
+  - Endpoints : /health + /extract + /extract-meta
   - Modèle unique : gpt-5.4-mini (override possible via OPENAI_MODEL env)
 """
 
@@ -45,6 +54,7 @@ class Metadata(BaseModel):
     invoice_number: str = Field(..., description="Référence devis_dexxxxxx")
     date:           str = Field(..., description="Date YYYY-MM-DD")
     currency:       str = Field(..., description="Code devise ISO")
+    ref_cde:        Optional[str] = Field(None, description="Référence commande client (texte libre, extrait par regex)")
 
 class LineItem(BaseModel):
     designation: str   = Field(..., description="Nom court du produit/service (5-8 mots max)")
@@ -77,6 +87,62 @@ class ExtractionResponse(BaseModel):
     error:      Optional[str]         = None
     file_url:   Optional[str]         = None
     model_used: Optional[str]         = None
+
+
+# Schema light pour /extract-meta : pas de line_items, pas de totals détaillés
+class MetaOnly(BaseModel):
+    vendor_name:    str = Field("", description="Nom de l'entreprise cliente")
+    project_name:   str = Field("", description="Nom du projet / chantier")
+    invoice_number: str = Field("", description="Référence devis_dexxxxxx")
+    date:           str = Field("", description="Date YYYY-MM-DD")
+    currency:       str = Field("EUR", description="Code devise ISO")
+    total_ht:       float = Field(0.0, description="Total HT")
+    ref_cde:        Optional[str] = Field(None, description="Référence commande client (regex)")
+
+class MetaExtractionResponse(BaseModel):
+    success:    bool
+    data:       Optional[MetaOnly] = None
+    error:      Optional[str]      = None
+    file_url:   Optional[str]      = None
+    model_used: Optional[str]      = None
+
+
+# ═══════════════════════════════════════════════════════
+# REF CDE — Extraction par regex (déterministe, sans IA)
+# ═══════════════════════════════════════════════════════
+
+def extract_ref_cde(text: str) -> Optional[str]:
+    """
+    Extract 'Ref Cde' from PDF text.
+    Pattern: 'Ref Cde : <texte>' jusqu'à 'Dossier suivi par' OU 'DEXXXXXX'
+    (numéro devis qui suit) OU double newline.
+    Returns None if not found, empty, or matches only a devis number.
+
+    Tested on 4 real devis (DE00005559, DE00005560, DE00005620, DE00005015) :
+      → "Complément travaux AR floor"
+      → "Sondage délamination – Zone AR"
+      → "REMISE EN ETAT DALLAGE-LA CHEVROLIERE (44)"
+      → "Option 1: Rectification de planéité selon EN15620 DM2 toute largeur"
+    """
+    if not text:
+        return None
+
+    match = re.search(
+        r'Ref\s*Cde\s*:\s*(.+?)\s*(?=Dossier\s+suivi\s+par|DE\d{6,}|\n\s*\n)',
+        text,
+        re.IGNORECASE | re.DOTALL
+    )
+    if not match:
+        return None
+
+    ref = match.group(1).strip()
+    ref = re.sub(r'\s+', ' ', ref)  # normalise espaces multiples + newlines
+
+    # Filter : si vide ou si ressemble à numéro devis seul
+    if not ref or re.fullmatch(r'DE\d+', ref, re.IGNORECASE):
+        return None
+
+    return ref
 
 
 # ═══════════════════════════════════════════════════════
@@ -125,543 +191,78 @@ def pdf_bytes_to_images_b64(pdf_bytes: bytes, dpi: int = 200) -> list[str]:
 
 def extract_text_from_pdf(pdf_bytes: bytes) -> str:
     """Extrait le texte de toutes les pages du PDF via pdfplumber."""
-    all_text = ""
+    out_pages = []
     try:
         with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf:
             for page in pdf.pages:
-                all_text += (page.extract_text() or "") + "\n"
+                txt = page.extract_text() or ""
+                out_pages.append(txt)
     except Exception as e:
-        logger.warning(f"[text] pdfplumber échoué: {e}")
+        logger.warning(f"[pdfplumber] échec : {e}")
         return ""
-    return all_text.strip()
+    return "\n\n".join(out_pages).strip()
 
 
 # ═══════════════════════════════════════════════════════
-# PROMPT TEXTE — V16.1 (optimisé pour texte pdfplumber)
+# PROMPT TEXT
 # ═══════════════════════════════════════════════════════
 
 SYSTEM_PROMPT_TEXT = """\
 Tu es un expert en extraction de données de devis de travaux BTP français.
-Ces devis sont émis par QUALIDAL (13 avenue du Parc Alata, 60100 Creil).
-Tu reçois le TEXTE BRUT extrait d'un PDF de devis (via pdfplumber).
+Ces devis sont toujours émis par la société QUALIDAL (13 avenue du Parc Alata, 60100 Creil).
+Tu reçois le TEXTE BRUT extrait d'un devis (toutes pages concaténées).
 Retourne UNIQUEMENT un JSON valide, sans texte ni markdown autour.
-
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-COMMENT LIRE LE TEXTE EXTRAIT
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-
-Le texte provient d'un tableau PDF avec colonnes : Description | Qté | U | P.U. HT | Montant HT | TVA
-
-Chaque ITEM est identifiable par une ligne contenant des CHIFFRES à la fin :
-  "Réparation épaufrures. 28,00 ML 120,00 3 360,00 20,00"
-  → C'est un item : designation="Réparation épaufrures", Qté=28, U=ML, P.U.HT=120, Montant=3360
-
-Les lignes SANS chiffres qui suivent = la DESCRIPTION de l'item précédent :
-  "Sciage de part et d'autre de l'épaufrure sur largeur requise..."
-  → Description de "Réparation épaufrures"
-
-Les lignes avec "0,00 0,00 0,00 0,00" = séparateurs, titres de section, ou CGV → PAS d'items.
-
-ATTENTION aux espaces dans les nombres :
-  "1 022,00" = 1022.0 (espace = séparateur milliers)
-  "16 750,00" = 16750.0
-  "1 500,00" = 1500.0
-  "1 700" = 1700.0 (pas de décimale → .0)
-  "156 878" = 156878.0 (pas de décimale → .0)
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 RÈGLE 1 — vendor_name
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-Entreprise CLIENTE (pas Qualidal). Chercher après "Monsieur/Madame" → ligne suivante.
-Sinon : première ligne en majuscules après le bloc Qualidal.
+vendor_name = entreprise CLIENTE (jamais Qualidal).
+Cherche le bloc d'adresse client en haut du devis.
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 RÈGLE 2 — project_name
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-Valeur de la ligne "Chantier" dans le tableau récapitulatif.
-Si courte, compléter avec "Adresse du chantier" ou "Ref Cde".
+project_name = valeur exacte du champ "Chantier".
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 RÈGLE 3 — invoice_number
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-Chercher "DE" + 4-10 chiffres → format "devis_de" + 8 chiffres min.
-DE00005612 → "devis_de00005612"
+Format devis_dexxxxxxxx (lowercase, 8 chiffres, padding zéros).
+Source : "DE00005559" → "devis_de00005559".
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 RÈGLE 4 — date
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-Colonne "Date" du tableau récapitulatif → AAAA-MM-JJ. Si absente : "".
+Format YYYY-MM-DD. Source = champ "Date" du tableau de tête.
+"11/02/2026" → "2026-02-11".
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-RÈGLE 5 — LINE ITEMS
+RÈGLE 5 — line_items
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-Un item valide = une ligne avec P.U. HT ≠ 0 OU Montant HT ≠ 0.
-
-NE PAS créer d'item pour :
-  • Lignes "0,00 0,00 0,00 0,00" (séparateurs/titres/CGV)
-  • Sous-totaux, totaux, CGV, "BON POUR ACCORD"
-  • Titres de section sans prix (ex: "MISSION CAPACITÉ DE CHARGE..." avec 0,00)
+Un item = une prestation avec P.U. HT ≠ 0 OU Montant HT ≠ 0.
+Lignes à 0,00 → NE PAS créer d'item.
+Sous-totaux de zone → NE PAS créer d'item.
+Titres de section ("Cellule 3 - ZIEGLER :") → NE PAS créer d'item.
 
 ── designation ──
-NOM COURT (4-8 mots). Première ligne de l'item, sans la description technique.
-
-CELLULES : si le texte contient "Cellule X - NOM :" avec 0,00 (titre de section),
-les items suivants doivent inclure " - Cellule X NOM" dans leur designation.
-Ex: sous "Cellule 3 -ZIEGLER :" → "Reprise ancrages - Cellule 3 ZIEGLER"
+Nom court (5-8 mots max). Première ligne de la cellule Description.
 
 ── description ──
-La description = le TEXTE COMPLET de la cellule pour cet item, y compris la ligne du titre.
-
-MÉTHODE :
-  1. Prendre la ligne qui contient les chiffres (Qté/P.U. HT) → extraire le texte AVANT les chiffres
-  2. Prendre toutes les lignes en dessous JUSQU'À la prochaine ligne avec des chiffres
-  3. Concaténer le tout = description complète
-
-Exemple :
-  "Rectification de planéité par ponçage Laser Grinder 1.00 FORF 192 940,00 ..."
-  "sur 3 voies de roulement (3 x 400 mm)"
-  "858 mètres linéaires d'allées étroites (13 allées de 66 m)"
-  "Conformité selon norme EN15620 DM2"
-  → designation = "Rectification de planéité par ponçage Laser Grinder"
-  → description = "Rectification de planéité par ponçage Laser Grinder sur 3 voies de roulement (3 x 400 mm) 858 mètres linéaires d'allées étroites (13 allées de 66 m) Conformité selon norme EN15620 DM2"
-
-Autre exemple :
-  "Réparation épaufrures. 134,00 ML 125,00 16 750,00 20,00"
-  "Sciage de part et d'autre de l'épaufrure..."
-  → designation = "Réparation épaufrures"
-  → description = "Réparation épaufrures. Sciage de part et d'autre de l'épaufrure..."
-
-Si AUCUN texte entre deux lignes chiffrées → description = "" (vide).
-Cas typiques avec description vide : "AMENÉ ET REPLI DU MATÉRIEL", "Trie des déchets",
-"Traitements des déchets", "TRAVAIL VENDREDI - SAMEDI - DIMANCHE".
+Texte COMPLET de la cellule Description (sous-sections, tirets, détails).
+EXCLURE CGV : "Travaux réalisés en semaine...", "Fourniture eau/électricité...",
+"QUALIDAL n'est pas responsable...".
 Ne JAMAIS prendre le texte d'un item voisin.
-Copier la description ENTIÈRE sans tronquer.
 
 ── quantity, unite, unit_price ──
 Lire les chiffres sur la ligne de l'item.
-Espaces = séparateurs de milliers : "1 022,00" = 1022.0 | "1 700" = 1700.0 | "156 878" = 156878.0
+Espaces = séparateurs de milliers : "1 022,00" = 1022.0 | "1 700" = 1700.0
 Virgule = décimal : "4,60" = 4.6
-Unités : FORF/ML/M2/UNIT→U/Heures/Jours/Semaine
-
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-RÈGLE 6 — totals
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-
-Chercher la ligne "Total HT ... Total TVA ... Total TTC" → extraire les valeurs.
-Appliquer les mêmes règles de format numérique.
-
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-FORMAT DE SORTIE — JSON STRICT
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-
-{
-  "metadata": {
-    "vendor_name": "...",
-    "project_name": "...",
-    "invoice_number": "devis_deXXXXXXXX",
-    "date": "YYYY-MM-DD",
-    "currency": "EUR"
-  },
-  "line_items": [
-    {
-      "designation": "...",
-      "description": "...",
-      "quantity": 0.0,
-      "unite": "...",
-      "unit_price": 0.0
-    }
-  ],
-  "totals": {
-    "subtotal_ht": 0.0,
-    "total_tax": 0.0,
-    "total_ttc": 0.0
-  }
-}"""
-
-
-# ═══════════════════════════════════════════════════════
-# EXTRACTION HYBRIDE — V16.2 : gpt-5.4-mini partout
-# ═══════════════════════════════════════════════════════
-
-async def extract_with_text(
-    pdf_bytes: bytes,
-    openai_client: AsyncOpenAI
-) -> tuple[InvoiceData, str]:
-    """
-    V16.2 HYBRIDE : extrait le texte via pdfplumber puis l'envoie à gpt-5.4-mini.
-    Fallback sur extract_with_vision si pdfplumber échoue.
-    """
-    t0 = time.time()
-
-    # Étape 1 : extraire le texte
-    pdf_text = extract_text_from_pdf(pdf_bytes)
-    t1 = time.time()
-    logger.info(f"[perf] pdfplumber: {t1-t0:.1f}s | {len(pdf_text)} chars")
-
-    # Si pdfplumber retourne peu de texte → fallback vision
-    if len(pdf_text) < 100:
-        logger.warning("[text] Texte trop court, fallback vision")
-        return await extract_with_vision(pdf_bytes, openai_client)
-
-    model = get_model()
-
-    # max_tokens adaptatif : gros devis → plus de place pour la réponse
-    max_tok = 8000 if len(pdf_text) > 5000 else 4000
-    logger.info(f"[text] Mode texte → {model} | {len(pdf_text)} chars (~{len(pdf_text)//4} tokens) | max_tokens={max_tok}")
-
-    last_error = None
-    for attempt in range(1, 3):
-        try:
-            resp = await openai_client.chat.completions.create(
-                model=model,
-                max_completion_tokens=max_tok,
-                temperature=0,
-                messages=[
-                    {"role": "system", "content": SYSTEM_PROMPT_TEXT},
-                    {"role": "user",   "content": f"Voici le texte extrait du devis Qualidal :\n\n{pdf_text}"}
-                ]
-            )
-        except Exception as e:
-            logger.exception(f"[text] Erreur OpenAI tentative {attempt}")
-            last_error = e
-            continue
-
-        finish_reason = resp.choices[0].finish_reason
-        raw = resp.choices[0].message.content.strip()
-        raw = re.sub(r'^```(?:json)?\s*', '', raw, flags=re.MULTILINE)
-        raw = re.sub(r'\s*```$',          '', raw, flags=re.MULTILINE).strip()
-
-        if finish_reason == "length":
-            logger.warning(f"[text] Tentative {attempt} tronquée. Retry...")
-            last_error = Exception("Réponse tronquée")
-            continue
-
-        try:
-            data = json.loads(raw)
-            break
-        except json.JSONDecodeError as e:
-            logger.error(f"[text] Tentative {attempt} JSON invalide: {e}\n{raw[:400]}")
-            last_error = e
-            continue
-    else:
-        raise HTTPException(status_code=500, detail=f"Extraction texte échouée après 2 tentatives: {last_error}")
-
-    # Sécurité invoice_number
-    inv = data.get("metadata", {}).get("invoice_number", "")
-    m = re.search(r'DE(\d{4,10})', inv, re.IGNORECASE)
-    if m:
-        data["metadata"]["invoice_number"] = f"devis_de{m.group(1).zfill(8)}"
-
-    n_items = len(data.get("line_items", []))
-    t2 = time.time()
-    logger.info(f"[perf] OpenAI: {t2-t1:.1f}s | {model} | {n_items} item(s)")
-    logger.info(f"[perf] TOTAL: {t2-t0:.1f}s (mode texte)")
-
-    if n_items == 0:
-        logger.warning("[text] ⚠ 0 items — tentative fallback vision")
-        return await extract_with_vision(pdf_bytes, openai_client)
-
-    try:
-        return InvoiceData(**data), f"{model} (text)"
-    except Exception as e:
-        logger.error(f"[text] Pydantic: {e} — fallback vision")
-        return await extract_with_vision(pdf_bytes, openai_client)
-
-
-# ═══════════════════════════════════════════════════════
-# PROMPT VISION  — V15 (conservé pour fallback)
-# ═══════════════════════════════════════════════════════
-
-SYSTEM_PROMPT_VISION = """\
-Tu es un expert en extraction de données de devis de travaux BTP français.
-Ces devis sont toujours émis par la société QUALIDAL (13 avenue du Parc Alata, 60100 Creil).
-Tu reçois une ou plusieurs images de pages d'un même devis.
-Retourne UNIQUEMENT un JSON valide, sans texte ni markdown autour.
-
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-⛔ RÈGLE ABSOLUE N°1 — NE PAS TRONQUER LES ITEMS
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-
-AVANT de commencer, compte visuellement TOUTES les lignes du tableau des
-prestations qui ont un P.U. HT ≠ 0 ou un Montant HT ≠ 0.
-Ce nombre est ton OBJECTIF. Tu dois produire EXACTEMENT ce nombre d'items.
-
-Si le devis fait 3 pages, parcours les 3 pages entièrement.
-Un item en bas de page 2 ou en haut de page 3 est AUSSI important qu'un item page 1.
-Ne jamais s'arrêter avant la dernière ligne du tableau.
-
-Items fréquemment manqués (sois EXTRA vigilant) :
-  • Les portes et seuils de portes (souvent en fin de tableau)
-  • Les bennes et évacuation de déchets
-  • Les remises et ristournes (prix négatifs)
-  • Les items en texte normal (non gras) sur un devis où les autres sont en gras
-  • Les items de fin de zone (dernier item avant un séparateur ou sous-total)
-  • Les "Amené et repli du matériel" et autres lignes courtes
-  • Les impacts et petites réparations ponctuelles (1-2 unités)
-  • Les éprouvettes et contrôles (souvent en fin de devis)
-
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-⛔ RÈGLE ABSOLUE N°2 — ZÉRO HALLUCINATION
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-
-Tu dois UNIQUEMENT retranscrire ce qui est VISUELLEMENT PRÉSENT dans les images.
-Il est STRICTEMENT INTERDIT d'inventer, compléter, déduire ou paraphraser du contenu.
-Si un texte est partiellement illisible : recopie ce que tu vois, ne complète pas.
-Ne jamais fusionner le contenu de deux cellules différentes.
-
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-⛔ RÈGLE ABSOLUE N°3 — FRONTIÈRE STRICTE ENTRE ITEMS
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-
-Le tableau des prestations a des colonnes : Description | Qté | U | P.U. HT | Montant HT | TVA
-Chaque item = UNE RANGÉE (ou groupe de rangées) avec des CHIFFRES dans les colonnes Qté/P.U. HT.
-
-⚠️ LA CLÉ : regarde les colonnes CHIFFRÉES (Qté, P.U. HT, Montant HT) pour délimiter les items.
-  → Chaque fois que tu vois des chiffres ALIGNÉS dans les colonnes Qté + U + P.U. HT,
-    c'est une NOUVELLE PRESTATION = un nouvel item.
-  → Le texte dans la colonne Description qui est sur LA MÊME RANGÉE que ces chiffres
-    (ou juste en dessous avant les prochains chiffres) = l'item avec sa description.
-
-MÉTHODE DE LECTURE EN 3 PASSES :
-
-PASSE 1 — INVENTAIRE : Parcours tout le tableau de haut en bas.
-  À chaque fois que tu vois des chiffres dans les colonnes Qté + P.U. HT, note :
-    "Item N : [texte de la ligne] — Qté=X, U=Y, P.U.HT=Z, Montant=W"
-  C'est ta LISTE DE RÉFÉRENCE. Compte-les = nombre d'items attendus.
-
-PASSE 2 — DESCRIPTION : Pour chaque item de ta liste :
-  - Le TITRE = la ligne (souvent en gras) qui est sur la même rangée que les chiffres
-  - La DESCRIPTION = le texte qui suit EN DESSOUS, JUSQU'À la rangée de l'item suivant
-  - Si le prochain item (chiffres suivants) commence IMMÉDIATEMENT après le titre
-    sans texte intermédiaire → description = "" (chaîne vide)
-
-PASSE 3 — VÉRIFICATION : Ton nombre d'items JSON doit correspondre au comptage de la passe 1.
-
-EXEMPLE VISUEL — Comment lire ce tableau :
-  ┌─────────────────────────────────────┬───────┬──────┬─────────┬──────────┐
-  │ AMENÉ ET REPLI DU MATÉRIEL - Zone 1 │  1,00 │ FORF │ 1 150,00│ 1 150,00 │ ← ITEM 1 (chiffres)
-  │                                     │       │      │         │          │
-  │ Préparation du support :            │  1,00 │ FORF │ 2 580,00│ 2 580,00 │ ← ITEM 2 (chiffres)
-  │ Ponçage diamant de la surface...    │       │      │         │          │   (description item 2)
-  │ Ponçage diamant manuel des bords... │       │      │         │          │   (suite description)
-  └─────────────────────────────────────┴───────┴──────┴─────────┴──────────┘
-
-  → Item 1 : "Amené et repli du matériel - Zone 1", description = "" car AUCUN texte
-    entre cette ligne et la suivante qui a des chiffres (Préparation du support).
-  → Item 2 : "Préparation du support", description = "Ponçage diamant de la surface..."
-    car ce texte est SOUS la rangée de l'item 2 et AVANT l'item 3.
-
-  ⚠️ ERREUR TYPIQUE À ÉVITER : attribuer "Ponçage diamant..." à "Amené et repli"
-     simplement parce que le texte apparaît visuellement en dessous. NON !
-     Il faut regarder les CHIFFRES : "Ponçage diamant" est dans la cellule
-     de "Préparation du support" (même rangée de chiffres), pas celle d'Amené et repli.
-
-INTERDIT :
-  • Prendre le texte descriptif d'un item voisin pour remplir un item qui n'en a pas
-  • Fusionner deux cellules de description adjacentes
-  • Inventer une description quand la cellule n'en contient pas
-  • Attribuer du texte à un item en se basant sur la proximité visuelle verticale
-    SANS vérifier l'alignement avec les colonnes chiffrées
-
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-⛔ RÈGLE ABSOLUE N°4 — NOMBRES ET FORMATS
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-
-Les devis français utilisent :
-  • L'ESPACE comme séparateur de milliers : "1 560,00" = 1560.00, "10 000,00" = 10000.00
-  • La VIRGULE comme séparateur décimal : "7,70" = 7.7
-  • Parfois un point pour les milliers sur certains devis : "1.560,00" = 1560.00
-  • Nombres SANS décimale : "1 700" = 1700.0, "156 878" = 156878.0
-
-MÉTHODE pour convertir un prix ou quantité :
-  1. Supprimer tous les espaces dans le nombre
-  2. Remplacer la virgule par un point décimal
-  3. Résultat = float
-  Exemples : "1 560,00" → 1560.0 | "28,50" → 28.5 | "1 760,00" → 1760.0 | "1 700" → 1700.0 | "156 878" → 156878.0
-
-VÉRIFICATION CROISÉE obligatoire :
-  Si Qté × P.U. HT ≠ Montant HT (à 1€ près) → relire les chiffres plus attentivement.
-  Exemples : 12 × 130 = 1560 ✓ | 18 × 63 = 1134 ✓ | 94 × 7.70 = 723.80 ✓
-
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-STRUCTURE GÉNÉRALE D'UN DEVIS QUALIDAL
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-
-Page 1 en-tête (haut gauche) : logo + adresse Qualidal
-Page 1 en-tête (haut droite) : destinataire → "Monsieur/Madame Prénom NOM" puis nom entreprise
-Tableau récapitulatif       : colonnes Chantier | Date | Date validité | Condition règlement | N° TVA
-Tableau des prestations     : colonnes Description | Qté | U | P.U. HT | (R%) | Montant HT | TVA
-Dernière page bas           : Totaux + "Adresse du chantier" + "BON POUR ACCORD"
-
-Le tableau des prestations peut s'étendre sur plusieurs pages.
-La colonne R% (remise) peut être absente.
-Il peut y avoir des sous-totaux ou des séparateurs de zones (ex: "Zone 1", "Cellule A").
-
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-RÈGLE 1 — vendor_name (entreprise CLIENTE)
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-
-C'est l'entreprise À QUI le devis est adressé. Jamais Qualidal.
-
-Méthode principale :
-  Repère "Monsieur", "Madame", "M.", "Mme" suivi d'un prénom et nom.
-  La ligne SUIVANTE est le nom de l'entreprise cliente.
-  Ex: "Monsieur Jean-Eudes Gohard" → ligne suivante → "IDEC"
-
-Méthode fallback (si pas de civilité) :
-  Après le bloc Qualidal (après "Email :" ou "Fax :"),
-  chercher la première ligne en majuscules qui n'est pas :
-  une adresse, un numéro de téléphone, "DEVIS", "FACTURE", ou une ville connue.
-
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-RÈGLE 2 — project_name (chantier)
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-
-Source primaire : valeur de la colonne "Chantier" dans le tableau récapitulatif.
-
-Cas 1 — valeur explicite et complète :
-  "AREFIM - REIMS (51)" → garder tel quel
-  "LOZENNES (59)" → garder tel quel
-
-Cas 2 — valeur courte ou nom propre seul (ex: "Autostore", "Amazon", "Lidl") :
-  Chercher "Adresse du chantier" ou "Ref Cde" en bas de page pour compléter.
-  Ex: Chantier="Autostore" + Adresse="Ussel" → "Autostore Ussel (19)"
-
-Cas 3 — valeur vide :
-  Utiliser "Ref Cde" si présent, sinon "INCONNU"
-
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-RÈGLE 3 — invoice_number
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-
-Cherche la référence commençant par "DE" suivie de 4 à 10 chiffres.
-Format de sortie OBLIGATOIRE : "devis_de" + numéro en minuscules, 8 chiffres minimum.
-  DE00004001 → "devis_de00004001"
-  DE1898     → "devis_de00001898"
-
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-RÈGLE 4 — date
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-
-Colonne "Date" du tableau récapitulatif (date d'émission, pas la date de validité).
-Convertir JJ/MM/AAAA → AAAA-MM-JJ. Si absente : "".
-
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-RÈGLE 5 — LINE ITEMS
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-
-── Qu'est-ce qu'un item valide ? ──────────────────
-
-Un item valide est une ligne du tableau qui remplit AU MOINS UNE condition :
-  • P.U. HT est un nombre différent de 0 (positif ou négatif)
-  • Montant HT est un nombre différent de 0 (positif ou négatif)
-  • Qté est renseignée ET l'unité est renseignée (même si prix=0)
-
-Ne PAS créer d'item pour :
-  • Lignes entièrement à 0,00 (séparateurs visuels vides)
-  • Sous-totaux ou totaux intermédiaires de zone
-  • Titres de sous-section sans quantité ET sans prix
-  • Conditions générales de vente
-  • La ligne de total général (Total HT, Total TVA, Total TTC)
-
-RÈGLE ABSOLUE — Le prix prime sur TOUT :
-  Si P.U. HT ≠ 0 OU Montant HT ≠ 0 → item obligatoire, sans exception.
-  • Même si la ligne commence par un tiret "- "
-  • Même si le texte est court ("Impact", "Amené et repli du matériel")
-  • Même si ce n'est PAS en gras
-  • Même si c'est la dernière ligne avant les totaux
-  Le style typographique (gras/normal/italique) n'est JAMAIS un critère d'exclusion.
-
-── designation ────────────────────────────────────
-
-NOM COURT de la prestation. 4 à 8 mots maximum.
-- Texte court (une ligne) → prendre tel quel
-- Texte long avec première ligne en gras → prendre uniquement cette première ligne
-- Remise → "Remise exceptionnelle" ou libellé exact court
-- Conserver l'identifiant de zone : "Grenaillage surface - Zone 1"
-- Designation sans deux-points (ex: "Impact", "Benne") → valide comme les autres
-- Parenthèse informative → designation = texte AVANT la parenthèse
-
-RÈGLE CELLULES — quand le devis contient des sections "Cellule X - NOM" :
-  Les lignes "Cellule 1 - THEBAULT :", "Cellule 2 - MARTIN :" etc. sont des
-  TITRES DE SECTION (pas d'items). Les items qui suivent DOIVENT inclure le nom
-  de la cellule dans leur designation.
-  Format : "{prestation} - {Cellule X NOM}"
-
-RÈGLE SPÉCIALE devis AMO / contrôle qualité :
-  Ces devis ont souvent un titre en GRAS ou MAJUSCULES suivi d'un long bloc descriptif.
-  Si le titre de section (ex: "CONTRÔLE QUALITÉ DALLAGE DE 6 600M²") a Qté=0 ET prix=0
-  → NE PAS créer d'item pour ce titre.
-  Les items SUIVANTS avec Qté + prix sont les vrais items à extraire.
-
-── description ────────────────────────────────────
-
-La description est le texte qui se trouve DANS LA MÊME RANGÉE du tableau
-que les chiffres de l'item, ou dans les lignes ENTRE cet item et le SUIVANT.
-
-MÉTHODE POUR DÉTERMINER LA DESCRIPTION D'UN ITEM :
-  1. Identifie la rangée de l'item (celle avec Qté + U + P.U. HT)
-  2. Regarde si le titre occupe toute la ligne ou s'il y a du texte descriptif
-     sur cette même rangée (après le titre, avant les chiffres)
-  3. Regarde les lignes EN DESSOUS : tout le texte JUSQU'À la prochaine rangée
-     qui a des chiffres dans Qté/P.U. HT = description de CET item
-  4. S'il n'y a AUCUN texte entre cette rangée et la prochaine rangée chiffrée
-     → description = "" (chaîne vide)
-
-PIÈGE PRINCIPAL — Items courts sans description :
-  Certaines lignes n'ont QUE le titre + les chiffres, sans aucun texte descriptif.
-  Le texte qui apparaît visuellement "en dessous" appartient en fait à l'ITEM SUIVANT.
-
-RÈGLES STRICTES :
-  1. Si la cellule contient UNIQUEMENT le titre SANS texte descriptif → description = ""
-  2. Ne JAMAIS emprunter le texte d'une cellule voisine pour remplir une description vide
-  3. La description se termine là où commence la RANGÉE SUIVANTE avec des chiffres
-  4. Inclure : texte principal, sous-sections, tirets, normes, dimensions
-  5. Exclure (CGV) : horaires de travail, fourniture eau/électricité, non-responsabilité
-     Qualidal, mentions légales, conditions de paiement, délais, "BON POUR ACCORD"
-  6. Pour une remise : description = "" (chaîne vide)
-  7. Copier la description ENTIÈRE et FIDÈLEMENT — ne pas tronquer à mi-phrase
-
-── quantity ───────────────────────────────────────
-
-Valeur numérique de la colonne Qté. Toujours un float.
-Si vide : 0.0
-ATTENTION parenthèses : "Réparation seuil de porte : (2 unités à 4ml)   2,00"
-→ quantity = 2.0 (la colonne Qté après ")"), PAS le "2" dans la parenthèse.
-
-ATTENTION FORMAT : les espaces sont des séparateurs de milliers.
-  "1 000,00" dans la colonne Qté → quantity = 1000.0 (pas 1.0)
-  "28,50" → 28.5 | "1 700" → 1700.0 | "156 878" → 156878.0
-
-── unite ──────────────────────────────────────────
-
-  FORF / Forfait / FF / Ens / Ensemble  → "FORF"
-  M2 / m² / M²                         → "M2"
-  ML / ml / m / Lin                    → "ML"
-  H / Heure / Heures / HR              → "Heures"
-  J / Jour / Jours                     → "Jours"
-  Sem / Semaine                        → "Semaine"
-  U / unité / pce / pièce / UNIT       → "U"
-  Vide ou non reconnu                  → "U"
-
-── unit_price ─────────────────────────────────────
-
-Valeur colonne P.U. HT. Peut être négatif (remise). Si vide : 0.0
-
-ATTENTION FORMAT : les espaces sont des séparateurs de milliers.
-  "1 760,00" → 1760.0 (pas 1.0 ni 760.0)
-  "7,70" → 7.7 | "1 700" → 1700.0 | "156 878" → 156878.0
-
-── Zones et sous-sections ─────────────────────────
-
-Titre de zone = pas de valeur dans Qté/U/P.U. HT/Montant HT → NE PAS créer d'item.
-Prestations dans une zone → items normaux avec nom de zone dans designation.
-Sous-totaux de zone → NE PAS créer d'item.
+Unités : FORF / ML / M2 / UNIT→U / Heures / Jours / Semaine
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 RÈGLE 6 — totals
@@ -707,6 +308,38 @@ FORMAT DE SORTIE — JSON STRICT, SANS MARKDOWN
 # EXTRACTION VISION  — fallback si pdfplumber échoue
 # ═══════════════════════════════════════════════════════
 
+SYSTEM_PROMPT_VISION = """\
+Tu es un expert en extraction de données de devis de travaux BTP français.
+Ces devis sont toujours émis par la société QUALIDAL (13 avenue du Parc Alata, 60100 Creil).
+Tu reçois une ou plusieurs images de pages d'un même devis.
+Retourne UNIQUEMENT un JSON valide, sans texte ni markdown autour.
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+⛔ RÈGLE ABSOLUE N°1 — NE PAS TRONQUER LES ITEMS
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+AVANT de commencer, compte visuellement TOUTES les lignes du tableau des
+prestations qui ont un P.U. HT ≠ 0 ou un Montant HT ≠ 0.
+Ce nombre est ton OBJECTIF. Tu dois produire EXACTEMENT ce nombre d'items.
+
+Si le devis fait 3 pages, parcours les 3 pages entièrement.
+Un item en bas de page 2 ou en haut de page 3 est AUSSI important qu'un item page 1.
+Ne jamais s'arrêter avant la dernière ligne du tableau.
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+RÈGLES MÉTADONNÉES & ITEMS
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+vendor_name = client (jamais Qualidal).
+project_name = champ Chantier.
+invoice_number = format devis_dexxxxxxxx (lowercase, 8 chiffres).
+date = YYYY-MM-DD.
+Espaces dans nombres = milliers ("1 700" = 1700.0).
+
+Format JSON identique au prompt texte.
+"""
+
+
 async def extract_with_vision(
     pdf_bytes: bytes,
     openai_client: AsyncOpenAI
@@ -726,6 +359,11 @@ async def extract_with_vision(
     n_pages = len(images_b64)
     img_sizes_kb = [len(b) * 3 / 4 / 1024 for b in images_b64]
     logger.info(f"[perf] PDF→images: {t1-t0:.1f}s | {n_pages} page(s) | {sum(img_sizes_kb):.0f} KB total")
+
+    # Tentative extraction texte pour Ref Cde (même en mode vision, on récupère ce qu'on peut)
+    pdf_text_for_ref = extract_text_from_pdf(pdf_bytes)
+    ref_cde_value = extract_ref_cde(pdf_text_for_ref)
+    logger.info(f"[ref_cde] (vision) regex → {ref_cde_value!r}")
 
     model = get_model()
     logger.info(f"[vision] fallback vision → {model}")
@@ -787,6 +425,10 @@ async def extract_with_vision(
     if m:
         data["metadata"]["invoice_number"] = f"devis_de{m.group(1).zfill(8)}"
 
+    # Injection ref_cde (regex, indépendant du LLM)
+    if "metadata" in data and isinstance(data["metadata"], dict):
+        data["metadata"]["ref_cde"] = ref_cde_value
+
     n_items = len(data.get("line_items", []))
     t2 = time.time()
     logger.info(f"[perf] OpenAI API: {t2-t1:.1f}s | {model} | {n_items} item(s)")
@@ -803,10 +445,138 @@ async def extract_with_vision(
 
 
 # ═══════════════════════════════════════════════════════
+# EXTRACTION HYBRIDE — V16.2 : gpt-5.4-mini partout
+# ═══════════════════════════════════════════════════════
+
+async def extract_with_text(
+    pdf_bytes: bytes,
+    openai_client: AsyncOpenAI
+) -> tuple[InvoiceData, str]:
+    """
+    V16.3 HYBRIDE : extrait le texte via pdfplumber puis l'envoie à gpt-5.4-mini.
+    Fallback sur extract_with_vision si pdfplumber échoue.
+    Ref Cde extraite par regex sur pdf_text avant appel OpenAI.
+    """
+    t0 = time.time()
+
+    # Étape 1 : extraire le texte
+    pdf_text = extract_text_from_pdf(pdf_bytes)
+    t1 = time.time()
+    logger.info(f"[perf] pdfplumber: {t1-t0:.1f}s | {len(pdf_text)} chars")
+
+    # Si pdfplumber retourne peu de texte → fallback vision
+    if len(pdf_text) < 100:
+        logger.warning("[text] Texte trop court, fallback vision")
+        return await extract_with_vision(pdf_bytes, openai_client)
+
+    # Extraction Ref Cde par regex (avant OpenAI, pas de tokens supplémentaires)
+    ref_cde_value = extract_ref_cde(pdf_text)
+    if ref_cde_value:
+        logger.info(f"[ref_cde] regex → {ref_cde_value!r}")
+    else:
+        logger.info("[ref_cde] regex → non trouvé")
+
+    model = get_model()
+
+    # max_tokens adaptatif : gros devis → plus de place pour la réponse
+    max_tok = 8000 if len(pdf_text) > 5000 else 4000
+    logger.info(f"[text] Mode texte → {model} | {len(pdf_text)} chars (~{len(pdf_text)//4} tokens) | max_tokens={max_tok}")
+
+    last_error = None
+    for attempt in range(1, 3):
+        try:
+            resp = await openai_client.chat.completions.create(
+                model=model,
+                max_completion_tokens=max_tok,
+                temperature=0,
+                messages=[
+                    {"role": "system", "content": SYSTEM_PROMPT_TEXT},
+                    {"role": "user",   "content": f"Voici le texte extrait du devis Qualidal :\n\n{pdf_text}"}
+                ]
+            )
+        except Exception as e:
+            logger.exception(f"[text] Erreur OpenAI tentative {attempt}")
+            last_error = e
+            continue
+
+        finish_reason = resp.choices[0].finish_reason
+        raw = resp.choices[0].message.content.strip()
+        raw = re.sub(r'^```(?:json)?\s*', '', raw, flags=re.MULTILINE)
+        raw = re.sub(r'\s*```$',          '', raw, flags=re.MULTILINE).strip()
+
+        if finish_reason == "length":
+            logger.warning(f"[text] Tentative {attempt} tronquée. Retry...")
+            last_error = Exception("Réponse tronquée")
+            continue
+
+        try:
+            data = json.loads(raw)
+            break
+        except json.JSONDecodeError as e:
+            logger.error(f"[text] Tentative {attempt} JSON invalide: {e}\n{raw[:400]}")
+            last_error = e
+            continue
+    else:
+        raise HTTPException(status_code=500, detail=f"Extraction texte échouée après 2 tentatives: {last_error}")
+
+    # Sécurité invoice_number
+    inv = data.get("metadata", {}).get("invoice_number", "")
+    m = re.search(r'DE(\d{4,10})', inv, re.IGNORECASE)
+    if m:
+        data["metadata"]["invoice_number"] = f"devis_de{m.group(1).zfill(8)}"
+
+    # Injection ref_cde (regex, indépendant du LLM)
+    if "metadata" in data and isinstance(data["metadata"], dict):
+        data["metadata"]["ref_cde"] = ref_cde_value
+
+    n_items = len(data.get("line_items", []))
+    t2 = time.time()
+    logger.info(f"[perf] OpenAI: {t2-t1:.1f}s | {model} | {n_items} item(s)")
+    logger.info(f"[perf] TOTAL: {t2-t0:.1f}s (mode texte)")
+
+    if n_items == 0:
+        logger.warning("[text] ⚠ 0 items — tentative fallback vision")
+        return await extract_with_vision(pdf_bytes, openai_client)
+
+    try:
+        return InvoiceData(**data), f"{model} (text)"
+    except Exception as e:
+        logger.error(f"[text] Pydantic: {e} — fallback vision")
+        return await extract_with_vision(pdf_bytes, openai_client)
+
+
+# ═══════════════════════════════════════════════════════
+# EXTRACTION META-ONLY (light) — pour /extract-meta
+# ═══════════════════════════════════════════════════════
+
+async def extract_meta_from_text(
+    pdf_bytes: bytes,
+    openai_client: AsyncOpenAI
+) -> tuple[MetaOnly, str]:
+    """
+    Extraction métadonnées seules (pas de line_items détaillés).
+    Plus rapide, moins cher. Pour le tableau de gestion devis.
+    Réutilise extract_with_text() qui retourne InvoiceData complet,
+    puis on map vers MetaOnly. Ref Cde déjà injectée par extract_with_text.
+    """
+    invoice_data, model_used = await extract_with_text(pdf_bytes, openai_client)
+    meta = MetaOnly(
+        vendor_name    = invoice_data.metadata.vendor_name,
+        project_name   = invoice_data.metadata.project_name,
+        invoice_number = invoice_data.metadata.invoice_number,
+        date           = invoice_data.metadata.date,
+        currency       = invoice_data.metadata.currency,
+        total_ht       = invoice_data.totals.subtotal_ht,
+        ref_cde        = invoice_data.metadata.ref_cde,
+    )
+    return meta, model_used
+
+
+# ═══════════════════════════════════════════════════════
 # APP & ROUTES
 # ═══════════════════════════════════════════════════════
 
-app = FastAPI(title="Invoice Extraction API", version="16.2.0")
+app = FastAPI(title="Invoice Extraction API", version="16.3.0")
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
 
 def get_openai_client() -> AsyncOpenAI:
@@ -845,8 +615,8 @@ async def upload_pdf_to_bubble(pdf_bytes: bytes, filename: str) -> str:
 async def health():
     return {
         "status": "ok",
-        "version": "16.2.0",
-        "mode": "hybrid (text first, vision fallback)",
+        "version": "16.3.0",
+        "mode": "hybrid (text first, vision fallback) + ref_cde regex",
         "model_default": DEFAULT_MODEL,
         "model_override": os.getenv("OPENAI_MODEL", "non défini — gpt-5.4-mini par défaut"),
     }
@@ -867,143 +637,13 @@ async def extract_invoice(file: UploadFile = File(...)):
         logger.exception("Error /extract")
         return ExtractionResponse(success=False, error=str(e))
 
-# ═══════════════════════════════════════════════════════
-# AJOUT — /extract-meta (métadonnées uniquement, pas d'items)
-# À AJOUTER À LA FIN DU FICHIER main.py, AVANT rien
-# NE MODIFIE RIEN de l'existant
-# ═══════════════════════════════════════════════════════
-
-
-# --- Schema métadonnées uniquement ---
-
-class MetadataExtract(BaseModel):
-    vendor_name:    str   = Field(..., description="Nom de l'entreprise cliente (pas Qualidal)")
-    project_name:   str   = Field(..., description="Nom du projet / chantier")
-    invoice_number: str   = Field(..., description="Référence devis_deXXXXXXXX")
-    date:           str   = Field(..., description="Date YYYY-MM-DD")
-    total_ht:       float = Field(..., description="Montant total HT")
-
-class MetaExtractionResponse(BaseModel):
-    success:    bool
-    data:       Optional[MetadataExtract] = None
-    file_url:   str = ""
-    model_used: str = ""
-    error:      Optional[str] = None
-
-
-# --- Prompt simplifié (métadonnées + total HT seulement) ---
-
-SYSTEM_PROMPT_META = """\
-Tu es un expert en extraction de métadonnées de devis de travaux BTP français.
-Ces devis sont émis par QUALIDAL (13 avenue du Parc Alata, 60100 Creil).
-Tu reçois le TEXTE BRUT extrait d'un PDF de devis.
-Retourne UNIQUEMENT un JSON valide, sans texte ni markdown autour.
-
-Tu dois extraire UNIQUEMENT ces 5 champs :
-
-1. vendor_name — Entreprise CLIENTE (pas Qualidal). Chercher après "Monsieur/Madame" → ligne suivante.
-2. project_name — Valeur de la ligne "Chantier" dans le tableau récapitulatif. Si courte, compléter avec "Adresse du chantier".
-3. invoice_number — Chercher "DE" + 4-10 chiffres → format "devis_de" + 8 chiffres min. Ex: DE00005612 → "devis_de00005612"
-4. date — Colonne "Date" du tableau récapitulatif → AAAA-MM-JJ. Si absente : ""
-5. total_ht — Ligne "Total HT" du devis. Espaces = séparateurs de milliers : "1 700" = 1700.0, "156 878,00" = 156878.0
-
-NE PAS extraire les lignes d'items ni les totaux TVA/TTC.
-
-FORMAT DE SORTIE :
-{
-  "vendor_name": "...",
-  "project_name": "...",
-  "invoice_number": "devis_deXXXXXXXX",
-  "date": "YYYY-MM-DD",
-  "total_ht": 0.0
-}"""
-
-
-# --- Fonction d'extraction métadonnées ---
-
-async def extract_meta_from_text(
-    pdf_bytes: bytes,
-    openai_client: AsyncOpenAI
-) -> tuple[MetadataExtract, str]:
-    """
-    Extrait uniquement les métadonnées + total HT via pdfplumber + LLM.
-    Beaucoup plus rapide et moins cher que /extract.
-    """
-    t0 = time.time()
-
-    # 1. Extraction texte (pdfplumber)
-    all_text = ""
-    try:
-        with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf:
-            # On ne prend que les 2 premières pages (métadonnées + total HT sont toujours là)
-            for page in pdf.pages[:2]:
-                all_text += (page.extract_text() or "") + "\n"
-    except Exception as e:
-        logger.warning(f"[extract-meta] pdfplumber échoué: {e}")
-        raise HTTPException(status_code=500, detail=f"Impossible de lire le PDF: {e}")
-
-    all_text = all_text.strip()
-    if len(all_text) < 50:
-        raise HTTPException(status_code=400, detail="PDF trop court ou illisible (texte < 50 car.)")
-
-    # 2. Appel LLM (métadonnées uniquement)
-    model = get_model()
-    t1 = time.time()
-
-    last_error = None
-    for attempt in range(1, 3):
-        try:
-            resp = await openai_client.chat.completions.create(
-                model=model,
-                max_completion_tokens=500,   # Beaucoup moins que /extract (8000)
-                temperature=0,
-                messages=[
-                    {"role": "system", "content": SYSTEM_PROMPT_META},
-                    {"role": "user",   "content": f"Voici le texte du devis :\n\n{all_text[:4000]}"}
-                ]
-            )
-        except Exception as e:
-            logger.exception(f"[extract-meta] Erreur OpenAI tentative {attempt}")
-            last_error = e
-            continue
-
-        raw = resp.choices[0].message.content.strip()
-        raw = re.sub(r'^```(?:json)?\s*', '', raw, flags=re.MULTILINE)
-        raw = re.sub(r'\s*```$',          '', raw, flags=re.MULTILINE).strip()
-
-        try:
-            data = json.loads(raw)
-            break
-        except json.JSONDecodeError as e:
-            logger.error(f"[extract-meta] Tentative {attempt} JSON invalide: {e}\n{raw[:300]}")
-            last_error = e
-            continue
-    else:
-        raise HTTPException(status_code=500, detail=f"Extraction meta échouée après 2 tentatives: {last_error}")
-
-    # 3. Sécurité invoice_number
-    inv = data.get("invoice_number", "")
-    m = re.search(r'DE(\d{4,10})', inv, re.IGNORECASE)
-    if m:
-        data["invoice_number"] = f"devis_de{m.group(1).zfill(8)}"
-
-    t2 = time.time()
-    logger.info(f"[extract-meta] ✓ {model} en {t2-t0:.1f}s — {data.get('vendor_name','')} / {data.get('invoice_number','')}")
-
-    try:
-        return MetadataExtract(**data), f"{model} (meta)"
-    except Exception as e:
-        logger.error(f"[extract-meta] Pydantic: {e}")
-        raise HTTPException(status_code=500, detail=f"Structure invalide: {e}")
-
-
-# --- Endpoint ---
 
 @app.post("/extract-meta", response_model=MetaExtractionResponse)
 async def extract_meta(file: UploadFile = File(...)):
     """
     Extraction métadonnées uniquement (pas d'items).
     Plus rapide, moins cher. Pour le tableau de gestion devis.
+    Inclut ref_cde extraite par regex.
     """
     try:
         pdf_bytes = await file.read()

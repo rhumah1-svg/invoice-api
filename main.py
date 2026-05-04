@@ -128,7 +128,7 @@ def extract_ref_cde(text: str) -> Optional[str]:
         return None
 
     match = re.search(
-        r'Ref\s*Cde\s*:\s*(.+?)\s*(?=Dossier\s+suivi\s+par|DE\d{6,}|\n\s*\n)',
+        r'Ref\s*Cde\s*:\s*(.+?)\s*(?=Dossier\s+suivi\s+par|DE\d{6,}|\n\s*\n|E[-\s]?[Mm]ail\s*:|\bT[ée]l\s*:|\bFax\s*:|N°\s+de\s+Tva)',
         text,
         re.IGNORECASE | re.DOTALL
     )
@@ -143,6 +143,43 @@ def extract_ref_cde(text: str) -> Optional[str]:
         return None
 
     return ref
+
+
+def extract_chantier(text: str) -> Optional[str]:
+    """
+    Extract 'Chantier' value from PDF text (regex, no LLM).
+    Pattern: la ligne sous le header "Chantier Date Condition... N° de Tva intracom"
+    et après la ligne "de l'offre" contient :
+        [CHANTIER] DD/MM/YYYY [DATE_VALIDITE] [CONDITION] [TVA]
+    On extrait tout ce qui précède la première date DD/MM/YYYY.
+
+    Tested on 6 real devis :
+      DE00005559 → "BVA3"
+      DE00005560 → "BVA3"
+      DE00005015 → "ARMOR IIMAK, LA CHEVROLIERE 44"
+      DE00005478 → "33 Av du Bois de la Pie"
+      DE00005534 → "ARMOR IIMAK, LA CHEVROLIERE 44"
+      Devis_4-130-131 → "05 Rue Nicolas Appert, 44118"
+    """
+    if not text:
+        return None
+
+    lines = text.split('\n')
+    for i, line in enumerate(lines):
+        # Trouver header "Chantier ... N° de Tva"
+        if re.search(r'Chantier\s+Date.*Tva', line, re.IGNORECASE):
+            # Chercher dans les 5 lignes suivantes la ligne avec une date DD/MM/YYYY
+            for j in range(i+1, min(i+6, len(lines))):
+                next_line = lines[j]
+                # Match : tout ce qui est avant la première DD/MM/YYYY
+                m = re.match(r'^(.+?)\s+(\d{1,2}/\d{1,2}/\d{4})', next_line)
+                if m:
+                    chantier = m.group(1).strip()
+                    chantier = re.sub(r'\s+', ' ', chantier)
+                    if chantier and not re.fullmatch(r'de\s+l\'offre', chantier, re.IGNORECASE):
+                        return chantier
+            return None
+    return None
 
 
 # ═══════════════════════════════════════════════════════
@@ -221,10 +258,42 @@ vendor_name = entreprise CLIENTE (jamais Qualidal).
 Cherche le bloc d'adresse client en haut du devis.
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-RÈGLE 2 — project_name
+RÈGLE 2 — project_name (CRITIQUE)
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-project_name = valeur exacte du champ "Chantier".
+project_name = TEXTE EXACT de la cellule sous l'en-tête "Chantier"
+dans le tableau de tête (Chantier | Date | Condition de règlement | N° de Tva intracom).
+
+Le project_name est UN SEUL champ court : la cellule sous "Chantier" du tableau,
+généralement de quelques mots (ex: "BVA3", "33 Av du Bois de la Pie",
+"ARMOR IIMAK, LA CHEVROLIERE 44").
+
+⚠️ PIÈGES FRÉQUENTS À ÉVITER :
+
+1. "Ref Cde" N'EST PAS le project_name. JAMAIS prendre Ref Cde comme project_name.
+   - Ref Cde est un titre fonctionnel libre rédigé par le commercial.
+   - Le Chantier est un identifiant court de lieu/code.
+
+2. "Adresse du chantier" en bas du devis n'est PAS le project_name.
+   - C'est l'adresse complète, plus longue.
+
+3. Si tu vois deux champs proches (Ref Cde et Chantier), prends TOUJOURS Chantier.
+
+EXEMPLES :
+- Devis DE00005478 :
+    Ref Cde : "Remise en état du dallage-PNII DC8-TREMBLAY EN FRANCE (93)"
+    Chantier : "33 Av du Bois de la Pie"
+    → project_name = "33 Av du Bois de la Pie"  (PAS la Ref Cde !)
+
+- Devis DE00005534 :
+    Ref Cde : "Option 2 : Rectification de planéité selon EN15620 DM2 toute largeur"
+    Chantier : "ARMOR IIMAK, LA CHEVROLIERE 44"
+    → project_name = "ARMOR IIMAK, LA CHEVROLIERE 44"
+
+- Devis DE00005559 :
+    Ref Cde : "Complément travaux AR floor"
+    Chantier : "BVA3"
+    → project_name = "BVA3"
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 RÈGLE 3 — invoice_number
@@ -428,6 +497,13 @@ async def extract_with_vision(
     # Injection ref_cde (regex, indépendant du LLM)
     if "metadata" in data and isinstance(data["metadata"], dict):
         data["metadata"]["ref_cde"] = ref_cde_value
+        # Override project_name avec valeur regex Chantier (priorité absolue sur LLM)
+        chantier_value = extract_chantier(pdf_text_for_ref)
+        if chantier_value:
+            old_pn = data["metadata"].get("project_name", "")
+            if old_pn != chantier_value:
+                logger.info(f"[vision] override project_name: {old_pn!r} → {chantier_value!r} (regex)")
+            data["metadata"]["project_name"] = chantier_value
 
     n_items = len(data.get("line_items", []))
     t2 = time.time()
@@ -528,6 +604,13 @@ async def extract_with_text(
     # Injection ref_cde (regex, indépendant du LLM)
     if "metadata" in data and isinstance(data["metadata"], dict):
         data["metadata"]["ref_cde"] = ref_cde_value
+        # Override project_name avec valeur regex Chantier (priorité absolue sur LLM)
+        chantier_value = extract_chantier(pdf_text)
+        if chantier_value:
+            old_pn = data["metadata"].get("project_name", "")
+            if old_pn != chantier_value:
+                logger.info(f"[text] override project_name: {old_pn!r} → {chantier_value!r} (regex)")
+            data["metadata"]["project_name"] = chantier_value
 
     n_items = len(data.get("line_items", []))
     t2 = time.time()
